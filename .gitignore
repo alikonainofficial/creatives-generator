@@ -1,0 +1,30 @@
+# Secrets — never commit
+.env
+credentials/
+
+# Cache / runtime artifacts
+video_cache.json
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Byte-compiled / distribution
+*.egg-info/
+dist/
+build/
