@@ -72,3 +72,12 @@ def mark_job_error(
         "error",
         extra_fields={"error": error},
     )
+
+
+def claim_job(jobs_worksheet: gspread.Worksheet, row_index: int) -> None:
+    """Transition a job from 'generating' → 'producing'.
+
+    Written immediately when a worker picks up a job so that a concurrent
+    session (or a second worker) won't attempt to process the same row.
+    """
+    update_job_status(jobs_worksheet, row_index, "producing")

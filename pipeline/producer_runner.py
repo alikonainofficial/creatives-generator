@@ -21,6 +21,7 @@ from services.gemini import GeminiClient
 from services.google_drive import GoogleDriveService
 from sheets.producer_reader import ClipRow, GeneratingJob, read_clips_for_job
 from sheets.producer_writer import (
+    claim_job,
     mark_job_done,
     mark_job_error,
     save_blueprint_to_job,
@@ -104,6 +105,11 @@ def run_producer_job(
         mark_job_error(jobs_worksheet, job.row_index, reason)
         emit(EVT_JOB_ERROR, reason)
         return ProducerJobResult(job_key=job.job_key, success=False, error=reason)
+
+    # ── Claim: transition generating → producing so concurrent workers/sessions
+    # won't pick up this row.  Any failure path calls mark_job_error which
+    # overwrites the status, so this is purely a forward-only guard.
+    claim_job(jobs_worksheet, job.row_index)
 
     # ── Phase 1: Blueprint ────────────────────────────────────────────────────
     emit(EVT_BLUEPRINT, "Validating blueprint")

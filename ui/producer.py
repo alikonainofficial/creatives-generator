@@ -4,6 +4,7 @@ import queue
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import streamlit as st
@@ -30,7 +31,7 @@ from pipeline.producer_runner import (
     run_producer_job,
 )
 from sheets.auth import get_gspread_client
-from sheets.producer_reader import read_generating_jobs
+from sheets.producer_reader import GeneratingJob, read_generating_jobs
 from sheets.reader import get_worksheet
 
 
@@ -43,6 +44,9 @@ _KEY_QUEUE = "producer_event_queue"
 _KEY_JOB_STATES = "producer_job_states"
 _KEY_RESULTS = "producer_results"
 _KEY_LOG = "producer_log"
+
+_DEFAULT_WORKERS = 5
+_MAX_WORKERS = 10
 
 
 def render() -> None:
@@ -149,6 +153,18 @@ For every job with `status = generating` in your sheet it:
                 step=5,
                 help="How often to check Kling/FFmpeg job status.",
             )
+            num_workers = st.number_input(
+                "Parallel workers",
+                min_value=1,
+                max_value=_MAX_WORKERS,
+                value=_DEFAULT_WORKERS,
+                step=1,
+                help=(
+                    f"Number of jobs to process simultaneously (1–{_MAX_WORKERS}). "
+                    "Each worker handles one job end-to-end with its own API connections. "
+                    "Clips within a single job are still generated sequentially."
+                ),
+            )
 
         submitted = st.form_submit_button("▶ Start Production", type="primary")
 
@@ -192,7 +208,11 @@ For every job with `status = generating` in your sheet it:
         )
         return
 
-    st.info(f"Found {len(jobs)} job(s) to produce. Starting background thread…")
+    actual_workers = min(int(num_workers), len(jobs))
+    st.info(
+        f"Found {len(jobs)} job(s) to produce. "
+        f"Starting {actual_workers} parallel worker(s)…"
+    )
 
     # ── Bootstrap shared state ────────────────────────────────────────────────
     event_queue: queue.Queue[tuple[str, str, Any]] = queue.Queue()
@@ -217,30 +237,59 @@ For every job with `status = generating` in your sheet it:
     st.session_state[_KEY_RESULTS] = []
     st.session_state[_KEY_RUNNING] = True
 
+    # Capture loop variables for the worker closure.
+    _sheet_id = sheet_id
+    _jobs_tab = jobs_tab.strip()
+    _clips_tab = clips_tab.strip()
+    _demo_tab = demo_tab.strip()
+    _drive_folder_id = drive_folder_id.strip()
+    _poll_interval = int(poll_interval)
+
+    def _run_worker(job: GeneratingJob) -> ProducerJobResult:
+        """Process one job end-to-end with its own isolated gspread connections.
+
+        Each worker opens a fresh gspread client so auth token refresh and the
+        underlying HTTP session are never shared across threads.
+        """
+        worker_client = get_gspread_client()
+        worker_spread = worker_client.open_by_key(_sheet_id)
+        worker_jobs_ws = get_worksheet(worker_spread, _jobs_tab)
+        worker_clips_ws = get_worksheet(worker_spread, _clips_tab)
+        worker_demos_ws = get_worksheet(worker_spread, _demo_tab) if _demo_tab else None
+
+        event_queue.put((job.job_key, "job_start", None))
+        try:
+            result = run_producer_job(
+                job=job,
+                jobs_worksheet=worker_jobs_ws,
+                clips_worksheet=worker_clips_ws,
+                drive_folder_id=_drive_folder_id,
+                demos_worksheet=worker_demos_ws,
+                progress_cb=lambda jk, et, d: event_queue.put((jk, et, d)),
+                poll_interval=_poll_interval,
+                max_poll_attempts=40,
+            )
+        except Exception as exc:
+            result = ProducerJobResult(
+                job_key=job.job_key,
+                success=False,
+                error=f"Unhandled exception: {exc}",
+            )
+            logger.exception("Unhandled error in producer job", extra={"job_key": job.job_key})
+
+        event_queue.put((job.job_key, "_result", result))
+        return result
+
     def _producer_thread() -> None:
-        for job in jobs:
-            event_queue.put((job.job_key, "job_start", None))
-            try:
-                result = run_producer_job(
-                    job=job,
-                    jobs_worksheet=jobs_ws,
-                    clips_worksheet=clips_ws,
-                    drive_folder_id=drive_folder_id.strip(),
-                    demos_worksheet=demos_ws,
-                    progress_cb=lambda jk, et, d: event_queue.put((jk, et, d)),
-                    poll_interval=int(poll_interval),
-                    max_poll_attempts=40,
-                )
-            except Exception as exc:
-                result = ProducerJobResult(
-                    job_key=job.job_key,
-                    success=False,
-                    error=f"Unhandled exception: {exc}",
-                )
-                logger.exception("Unhandled error in producer job", extra={"job_key": job.job_key})
-
-            event_queue.put((job.job_key, "_result", result))
-
+        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+            futures = {executor.submit(_run_worker, job): job for job in jobs}
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    # Exceptions are already caught and enqueued inside _run_worker;
+                    # this guard is a last-resort safety net.
+                    pass
         event_queue.put(("__all__", "_done", None))
 
     thread = threading.Thread(target=_producer_thread, daemon=True)
@@ -306,7 +355,11 @@ def _render_active_run() -> None:
         st.session_state[_KEY_RUNNING] = False
         _render_completion_summary(results)
     else:
-        st.info("Production running in background… page refreshes every 5 seconds.")
+        running_count = sum(1 for s in job_states.values() if s["status"] == "running")
+        st.info(
+            f"Production running — {running_count} job(s) active in parallel. "
+            "Page refreshes every 5 seconds."
+        )
         time.sleep(5)
         st.rerun()
 
