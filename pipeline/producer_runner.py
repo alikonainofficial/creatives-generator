@@ -20,6 +20,7 @@ from pipeline.video_stitcher import stitch_clips
 from services.cloudinary_svc import CloudinaryService, VideoUploadResult
 from services.elevenlabs import ElevenLabsClient
 from services.fal_ai import FalAiClient
+from services.voice_selector import select_voice_for_subject
 from services.fal_queue import FalQueueClient
 from services.gemini import GeminiClient
 from services.google_drive import GoogleDriveService
@@ -59,6 +60,9 @@ EVT_CAPTION_ERROR = "caption_error"
 EVT_PRONUNCIATION_START = "pronunciation_start"
 EVT_PRONUNCIATION_DONE = "pronunciation_done"
 EVT_PRONUNCIATION_ERROR = "pronunciation_error"
+EVT_VOICE_SELECTION_START = "voice_selection_start"
+EVT_VOICE_SELECTION_DONE = "voice_selection_done"
+EVT_VOICE_SELECTION_SKIP = "voice_selection_skip"
 EVT_JOB_DONE = "job_done"
 EVT_JOB_ERROR = "job_error"
 
@@ -93,17 +97,24 @@ def run_producer_job(
     max_poll_attempts: int = 40,
     enable_captions: bool = False,
     enable_pronunciation_fix: bool = True,
+    enable_voice_selection: bool = True,
 ) -> ProducerJobResult:
     """Run the complete producer pipeline for one job.
 
     Phases (mirrors n8n Producer v2):
-      1. Validate / generate video blueprint
-      2. Sequential clip generation (SceneLock frame chaining)
+      1.   Validate / generate video blueprint
+      1.5. Optionally select ElevenLabs voice for this subject (AI + gender pre-filter)
+      2.   Sequential clip generation (SceneLock frame chaining)
       2.5. Optionally fix pronunciation (ElevenLabs TTS + Kling LipSync + Demucs)
       2.6. Optionally burn word-by-word captions into each generated clip
-      3. Stitch clips via FAL FFmpeg
-      4. Upload final video to Google Drive
-      5. Write URLs + status back to sheet
+      3.   Stitch clips via FAL FFmpeg
+      4.   Upload final video to Google Drive
+      5.   Write URLs + status back to sheet
+
+    When enable_voice_selection=True (default) and enable_pronunciation_fix=True,
+    Gemini vision analyzes the subject's image and selects the best matching
+    ElevenLabs voice from the user's voice library (pre-filtered by gender).
+    Falls back to the default/env-var voice on any failure.
 
     When enable_pronunciation_fix=True (default), each Kling clip's dialogue
     audio is replaced with ElevenLabs TTS (phoneme-level control) while Demucs
@@ -177,6 +188,43 @@ def run_producer_job(
             "For Jobs sheet: ensure the batch pipeline has run and written swapped_start_frame_url. "
             "For Personas sheet: ensure the Persona Batch pipeline has run and persona_image is populated."
         )
+
+    # ── Phase 1.5: Voice selection ────────────────────────────────────────────
+    # Only runs when both pronunciation fix and voice selection are enabled.
+    # Falls back gracefully to the default/env-var voice on any failure.
+    selected_voice_id: str | None = None
+    if enable_pronunciation_fix and enable_voice_selection:
+        emit(EVT_VOICE_SELECTION_START, {"job_key": job.job_key, "gender": job.gender})
+        voice_result = select_voice_for_subject(
+            image_url=job.swapped_start_frame_url,
+            gender=job.gender,
+            elevenlabs_api_key=elevenlabs._api_key,
+            gemini=gemini,
+        )
+        if voice_result is not None:
+            selected_voice_id = voice_result.voice_id
+            emit(
+                EVT_VOICE_SELECTION_DONE,
+                {
+                    "voice_id": voice_result.voice_id,
+                    "name": voice_result.name,
+                    "reasoning": voice_result.reasoning,
+                },
+            )
+            logger.info(
+                "Voice selected for job",
+                extra={
+                    "job_key": job.job_key,
+                    "voice_id": voice_result.voice_id,
+                    "name": voice_result.name,
+                },
+            )
+        else:
+            emit(EVT_VOICE_SELECTION_SKIP, {"reason": "selection failed — using default voice"})
+            logger.warning(
+                "Voice selection skipped — using default voice",
+                extra={"job_key": job.job_key},
+            )
 
     # ── Phase 2: Load clips ───────────────────────────────────────────────────
     clips = read_clips_for_job(clips_worksheet, job.job_key)
@@ -336,6 +384,7 @@ def run_producer_job(
                     clip_key=clip.clip_key,
                     poll_interval=poll_interval,
                     max_poll_attempts=max_poll_attempts,
+                    voice_id=selected_voice_id,
                 )
                 raw_video_url = fixed_url
                 emit(

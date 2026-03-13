@@ -260,6 +260,7 @@ def apply_pronunciation_fix(
     clip_key: str = "",
     poll_interval: int = _LIPSYNC_POLL_INTERVAL,
     max_poll_attempts: int = _LIPSYNC_MAX_ATTEMPTS,
+    voice_id: str | None = None,
 ) -> str:
     """Replace Kling's audio with ElevenLabs TTS while preserving background ambience.
 
@@ -310,7 +311,7 @@ def apply_pronunciation_fix(
         )
 
         # ── 3. ElevenLabs TTS ─────────────────────────────────────────────────
-        tts_fal_url = elevenlabs.text_to_speech_and_upload(dialogue)
+        tts_fal_url = elevenlabs.text_to_speech_and_upload(dialogue, voice_id=voice_id)
 
         # ── 4. Kling LipSync ──────────────────────────────────────────────────
         _logger.info("Submitting Kling LipSync job", extra={"clip_key": clip_key})
