@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 
 import cloudinary
 import cloudinary.uploader
 import httpx
+
+
+@dataclass
+class VideoUploadResult:
+    url: str
+    duration_s: float
 
 
 class CloudinaryService:
@@ -43,11 +50,12 @@ class CloudinaryService:
         video_url: str,
         folder: str = "",
         public_id: str | None = None,
-    ) -> str:
-        """Upload a video from a URL to Cloudinary and return the secure URL.
+    ) -> VideoUploadResult:
+        """Upload a video from a URL to Cloudinary.
 
-        Uses the unsigned upload preset pattern from the n8n pipeline:
-        folder=ai-generated/clips/{job_key}, public_id={job_key}_clip_{index}.
+        Returns a VideoUploadResult with the secure URL and the actual
+        video duration reported by Cloudinary (important because Kling may
+        produce clips shorter than the requested duration).
         """
         kwargs: dict = {"resource_type": "video"}
         if folder:
@@ -56,4 +64,7 @@ class CloudinaryService:
             kwargs["public_id"] = public_id
 
         result = cloudinary.uploader.upload(video_url, **kwargs)
-        return result["secure_url"]
+        return VideoUploadResult(
+            url=result["secure_url"],
+            duration_s=float(result.get("duration", 0)),
+        )

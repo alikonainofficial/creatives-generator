@@ -28,6 +28,9 @@ from pipeline.producer_runner import (
     EVT_DRIVE_UPLOAD,
     EVT_JOB_DONE,
     EVT_JOB_ERROR,
+    EVT_PRONUNCIATION_DONE,
+    EVT_PRONUNCIATION_ERROR,
+    EVT_PRONUNCIATION_START,
     EVT_STITCH_DONE,
     EVT_STITCH_POLL,
     EVT_STITCH_START,
@@ -170,6 +173,17 @@ For every job with `status = generating` in your sheet it:
                     "Clips within a single job are still generated sequentially."
                 ),
             )
+            enable_pronunciation_fix = st.checkbox(
+                "Fix pronunciation (ElevenLabs + LipSync)",
+                value=True,
+                help=(
+                    "Replace Kling's native audio with ElevenLabs TTS for accurate "
+                    "pronunciation. Demucs preserves background ambient audio (street "
+                    "noise, music, etc.), then re-syncs lips via Kling LipSync. "
+                    "Requires ELEVENLABS_API_KEY in your environment. "
+                    "Adds ~60–90 s per clip. Falls back to original Kling audio on error."
+                ),
+            )
             enable_captions = st.checkbox(
                 "Add captions",
                 value=False,
@@ -259,6 +273,7 @@ For every job with `status = generating` in your sheet it:
     _demo_tab = demo_tab.strip()
     _drive_folder_id = drive_folder_id.strip()
     _poll_interval = int(poll_interval)
+    _enable_pronunciation_fix = bool(enable_pronunciation_fix)
     _enable_captions = bool(enable_captions)
 
     def _run_worker(job: GeneratingJob) -> ProducerJobResult:
@@ -284,6 +299,7 @@ For every job with `status = generating` in your sheet it:
                 progress_cb=lambda jk, et, d: event_queue.put((jk, et, d)),
                 poll_interval=_poll_interval,
                 max_poll_attempts=40,
+                enable_pronunciation_fix=_enable_pronunciation_fix,
                 enable_captions=_enable_captions,
             )
         except Exception as exc:
@@ -431,6 +447,21 @@ def _apply_event(
 
     elif event_type == EVT_CLIP_ERROR:
         log.append(f"[{ts}] {job_key} — clip error: {data}")
+
+    elif event_type == EVT_PRONUNCIATION_START:
+        idx = data.get("clip_index", "?") if isinstance(data, dict) else "?"
+        state["current_step"] = f"Pronunciation fix clip {idx}"
+        log.append(f"[{ts}] {job_key} — pronunciation fix clip {idx} (Demucs + ElevenLabs + LipSync)")
+
+    elif event_type == EVT_PRONUNCIATION_DONE:
+        idx = data.get("clip_index", "?") if isinstance(data, dict) else "?"
+        log.append(f"[{ts}] {job_key} — clip {idx} pronunciation fixed")
+
+    elif event_type == EVT_PRONUNCIATION_ERROR:
+        if isinstance(data, dict):
+            log.append(f"[{ts}] {job_key} — ⚠ pronunciation warning: {data.get('error', data)}")
+        else:
+            log.append(f"[{ts}] {job_key} — ⚠ pronunciation warning: {data}")
 
     elif event_type == EVT_CAPTION_START:
         idx = data.get("clip_index", "?") if isinstance(data, dict) else "?"
