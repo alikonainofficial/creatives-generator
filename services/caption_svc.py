@@ -36,6 +36,7 @@ def add_captions(
             "video_url": video_url,
             "words_per_subtitle": 1,
             "font_color": "white",
+            "highlight_color": "white",
             "font_name": "Montserrat",
             "font_weight": "bold",
             "font_size": 100,
