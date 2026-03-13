@@ -68,3 +68,23 @@ class CloudinaryService:
             url=result["secure_url"],
             duration_s=float(result.get("duration", 0)),
         )
+
+    def upload_media_file(
+        self,
+        file_path: str,
+        folder: str = "",
+        public_id: str | None = None,
+    ) -> str:
+        """Upload a local audio or video file to Cloudinary.
+
+        Uses resource_type="video" which handles both audio and video.
+        Returns the secure URL.
+        """
+        kwargs: dict = {"resource_type": "video"}
+        if folder:
+            kwargs["folder"] = folder
+        if public_id:
+            kwargs["public_id"] = public_id
+
+        result = cloudinary.uploader.upload(file_path, **kwargs)
+        return result["secure_url"]

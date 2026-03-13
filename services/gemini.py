@@ -6,6 +6,7 @@ import re
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 from google import genai
@@ -24,6 +25,18 @@ def _extract_json_from_response(text: str) -> str:
     if brace_match:
         return brace_match.group(0).strip()
     return text
+
+
+def _image_mime_type(url: str) -> str:
+    """Infer the MIME type of an image URL from its extension."""
+    lower = url.lower().split("?")[0]
+    if lower.endswith(".png"):
+        return "image/png"
+    if lower.endswith(".webp"):
+        return "image/webp"
+    if lower.endswith(".gif"):
+        return "image/gif"
+    return "image/jpeg"
 
 
 class GeminiClient:
@@ -88,17 +101,9 @@ class GeminiClient:
             "Return only valid JSON, no markdown, no commentary."
         )
 
-        url_lower = image_url.lower().split("?")[0]
-        if url_lower.endswith(".png"):
-            mime_type = "image/png"
-        elif url_lower.endswith(".webp"):
-            mime_type = "image/webp"
-        elif url_lower.endswith(".gif"):
-            mime_type = "image/gif"
-        else:
-            mime_type = "image/jpeg"
-
-        image_part = types.Part.from_uri(file_uri=image_url, mime_type=mime_type)
+        image_part = types.Part.from_uri(
+            file_uri=image_url, mime_type=_image_mime_type(image_url)
+        )
 
         start = time.time()
         result = self._client.models.generate_content(
@@ -135,17 +140,9 @@ class GeminiClient:
             "No other text."
         )
 
-        url_lower = image_url.lower().split("?")[0]
-        if url_lower.endswith(".png"):
-            mime_type = "image/png"
-        elif url_lower.endswith(".webp"):
-            mime_type = "image/webp"
-        elif url_lower.endswith(".gif"):
-            mime_type = "image/gif"
-        else:
-            mime_type = "image/jpeg"
-
-        image_part = types.Part.from_uri(file_uri=image_url, mime_type=mime_type)
+        image_part = types.Part.from_uri(
+            file_uri=image_url, mime_type=_image_mime_type(image_url)
+        )
 
         start = time.time()
         result = self._client.models.generate_content(
@@ -160,3 +157,69 @@ class GeminiClient:
             extra={"image_url": image_url, "duration_seconds": round(elapsed, 2), "gender": normalized},
         )
         return normalized
+
+    def select_voice_for_image(
+        self,
+        image_url: str,
+        voices: list[dict[str, Any]],
+        vo_hint: str = "",
+    ) -> dict[str, Any]:
+        """Select the best ElevenLabs voice for the character visible in the image.
+
+        voices: list of compact voice dicts (voice_id, name, gender, accent, …).
+        vo_hint: optional operator instruction to bias the selection.
+
+        Returns {"voice_id": str, "name": str, "reasoning": str}.
+        Raises ValueError if Gemini returns a voice_id not present in the catalog
+        (guards against hallucinated IDs).
+        """
+        hint_block = (
+            f"\nOperator instruction: {vo_hint.strip()}" if vo_hint.strip() else ""
+        )
+        prompt = (
+            "You are a casting director selecting a text-to-speech voice for the "
+            "character in this image.\n\n"
+            f"Available voices:\n{json.dumps(voices, indent=2)}\n"
+            f"{hint_block}\n\n"
+            "Pick the single voice that best fits the character's apparent age, "
+            "gender, energy, and personality.\n"
+            'Return a JSON object with exactly these three fields:\n'
+            '  "voice_id": the exact voice_id string from the list above\n'
+            '  "name": the corresponding voice name\n'
+            '  "reasoning": one sentence explaining why this voice fits\n'
+            "Return only valid JSON — no markdown fences, no extra keys."
+        )
+
+        image_part = types.Part.from_uri(
+            file_uri=image_url, mime_type=_image_mime_type(image_url)
+        )
+
+        start = time.time()
+        result = self._client.models.generate_content(
+            model="gemini-3.1-pro-preview",
+            contents=[image_part, prompt],
+            config={"response_mime_type": "application/json"},
+        )
+        elapsed = time.time() - start
+
+        try:
+            data: dict[str, Any] = json.loads(_extract_json_from_response(result.text))
+        except (json.JSONDecodeError, AttributeError) as exc:
+            raise ValueError(f"Gemini returned non-JSON response: {exc}") from exc
+
+        known_ids = {v["voice_id"] for v in voices}
+        if data.get("voice_id") not in known_ids:
+            raise ValueError(
+                f"Gemini returned voice_id={data.get('voice_id')!r} "
+                "which is not present in the provided catalog"
+            )
+
+        self._logger.info(
+            "Gemini voice selection completed",
+            extra={
+                "voice_id": data.get("voice_id"),
+                "voice_name": data.get("name"),
+                "duration_seconds": round(elapsed, 2),
+            },
+        )
+        return data
