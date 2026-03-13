@@ -361,7 +361,7 @@ def _render_active_run() -> None:
         }
         for s in job_states.values()
     ]
-    st.dataframe(table_rows, use_container_width=True)
+    st.dataframe(table_rows, width="stretch")
 
     # Recent log
     if log:
