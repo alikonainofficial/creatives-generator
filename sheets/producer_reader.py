@@ -64,12 +64,16 @@ def _read_records(worksheet: gspread.Worksheet) -> list[dict[str, Any]]:
 
 
 def read_generating_jobs(jobs_worksheet: gspread.Worksheet) -> list[GeneratingJob]:
-    """Read all rows with status='generating' from a Jobs (or Personas) worksheet."""
+    """Read all rows with status='generating' or 'producing' from a Jobs (or Personas) worksheet.
+
+    'producing' rows are included so that jobs claimed by a worker in a previous
+    (crashed) session can be recovered and re-queued on the next run.
+    """
     records = _read_records(jobs_worksheet)
 
     jobs: list[GeneratingJob] = []
     for i, row in enumerate(records, start=2):  # row 1 is header
-        if str(row.get("status", "")).strip().lower() != "generating":
+        if str(row.get("status", "")).strip().lower() not in ("generating", "producing"):
             continue
 
         job_key = str(row.get("job_key", "")).strip()
