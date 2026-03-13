@@ -7,6 +7,9 @@ import fal_client
 
 from logging_config import get_logger
 
+_DEMUCS_MODEL = "fal-ai/demucs"
+_DEMUCS_ALL_STEMS = ("vocals", "drums", "bass", "other", "guitar", "piano")
+
 
 class FalAiClient:
     def __init__(self, api_key: str | None = None):
@@ -166,6 +169,48 @@ class FalAiClient:
             },
         )
         return _extract_image_url(result)
+
+
+    def demucs_separate(self, audio_url: str) -> dict[str, str]:
+        """Separate audio into stems using Demucs (htdemucs_6s).
+
+        Returns a dict mapping stem name → URL for every stem that was found.
+        Possible keys: vocals, drums, bass, other, guitar, piano.
+
+        For AI-generated talking-head clips the relevant background stems are
+        typically "other" (ambient noise) with drums/bass/guitar/piano empty.
+        """
+        start = time.time()
+        result = fal_client.subscribe(
+            _DEMUCS_MODEL,
+            arguments={
+                "audio_url": audio_url,
+                "model": "htdemucs_6s",
+                "output_format": "mp3",
+            },
+        )
+        elapsed = time.time() - start
+
+        stems: dict[str, str] = {}
+        for stem_name in _DEMUCS_ALL_STEMS:
+            stem_data = result.get(stem_name)
+            if isinstance(stem_data, dict):
+                url = stem_data.get("url", "")
+            elif isinstance(stem_data, str):
+                url = stem_data
+            else:
+                url = ""
+            if url:
+                stems[stem_name] = url
+
+        self._logger.info(
+            "Demucs separation complete",
+            extra={
+                "stems_found": list(stems.keys()),
+                "duration_seconds": round(elapsed, 2),
+            },
+        )
+        return stems
 
 
 def _extract_image_url(result: object) -> str:

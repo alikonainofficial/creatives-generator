@@ -8,6 +8,7 @@ import gspread
 
 from logging_config import get_logger
 from pipeline.clip_generator import (
+    apply_pronunciation_fix,
     build_clip_context,
     build_last_frame_url,
     extract_video_url_from_kling_result,
@@ -16,7 +17,9 @@ from pipeline.clip_generator import (
 from services.caption_svc import add_captions
 from pipeline.video_blueprint import generate_blueprint, validate_blueprint
 from pipeline.video_stitcher import stitch_clips
-from services.cloudinary_svc import CloudinaryService
+from services.cloudinary_svc import CloudinaryService, VideoUploadResult
+from services.elevenlabs import ElevenLabsClient
+from services.fal_ai import FalAiClient
 from services.fal_queue import FalQueueClient
 from services.gemini import GeminiClient
 from services.google_drive import GoogleDriveService
@@ -53,6 +56,9 @@ EVT_CAPTION_START = "caption_start"
 EVT_CAPTION_POLL = "caption_poll"
 EVT_CAPTION_DONE = "caption_done"
 EVT_CAPTION_ERROR = "caption_error"
+EVT_PRONUNCIATION_START = "pronunciation_start"
+EVT_PRONUNCIATION_DONE = "pronunciation_done"
+EVT_PRONUNCIATION_ERROR = "pronunciation_error"
 EVT_JOB_DONE = "job_done"
 EVT_JOB_ERROR = "job_error"
 
@@ -86,27 +92,41 @@ def run_producer_job(
     poll_interval: int = 30,
     max_poll_attempts: int = 40,
     enable_captions: bool = False,
+    enable_pronunciation_fix: bool = True,
 ) -> ProducerJobResult:
     """Run the complete producer pipeline for one job.
 
     Phases (mirrors n8n Producer v2):
       1. Validate / generate video blueprint
       2. Sequential clip generation (SceneLock frame chaining)
-      2.5. Optionally burn word-by-word captions into each generated clip
+      2.5. Optionally fix pronunciation (ElevenLabs TTS + Kling LipSync + Demucs)
+      2.6. Optionally burn word-by-word captions into each generated clip
       3. Stitch clips via FAL FFmpeg
       4. Upload final video to Google Drive
       5. Write URLs + status back to sheet
 
-    When enable_captions=True, captions are applied to each Kling-generated clip before
-    stitching. The app demo clip (injected via _inject_demo_if_needed) is never captioned.
-    The SceneLock last-frame chain always uses the original (pre-caption) Cloudinary URL so
-    the face-swap anchor is not contaminated by burned-in text.
+    When enable_pronunciation_fix=True (default), each Kling clip's dialogue
+    audio is replaced with ElevenLabs TTS (phoneme-level control) while Demucs
+    preserves the original background ambient audio. Requires ELEVENLABS_API_KEY
+    to be set; falls back to the raw Kling clip silently if the key is absent or
+    the fix fails.
+
+    When enable_captions=True, captions are applied after the pronunciation fix.
+    The SceneLock last-frame chain always uses the original (pre-fix, pre-caption)
+    Cloudinary URL so the face-swap anchor is never contaminated.
     """
     logger = get_logger(__name__, job_key=job.job_key)
     gemini = GeminiClient()
     fal_queue = FalQueueClient()
+    fal_ai = FalAiClient()
+    elevenlabs = ElevenLabsClient()
     cloudinary_svc = CloudinaryService()
     drive_svc = GoogleDriveService()
+
+    # Disable pronunciation fix at runtime if the API key is missing.
+    if enable_pronunciation_fix and not elevenlabs._api_key:
+        logger.warning("ELEVENLABS_API_KEY not set — pronunciation fix disabled for this job")
+        enable_pronunciation_fix = False
 
     def emit(event_type: str, data: Any = None) -> None:
         if progress_cb:
@@ -190,10 +210,15 @@ def run_producer_job(
         cs = next(s for s in clip_statuses if s.clip_key == clip.clip_key)
 
         # Already finished — collect last frame for chaining and continue.
+        # Prefer the pre-populated start_frame_url from the sheet (written
+        # during the original run with the correct actual duration) over
+        # recomputing from the requested duration_s, which may exceed the
+        # actual video length.
         if clip.status == "done" and clip.clip_video_url:
-            last_frame_urls[clip.clip_index] = build_last_frame_url(
-                clip.clip_video_url, clip.duration_s
-            )
+            if clip.clip_index not in last_frame_urls:
+                last_frame_urls[clip.clip_index] = build_last_frame_url(
+                    clip.clip_video_url, clip.duration_s
+                )
             cs.status = "done"
             cs.clip_video_url = clip.clip_video_url
             logger.info("Skipping already-done clip", extra={"clip_key": clip.clip_key})
@@ -232,7 +257,8 @@ def run_producer_job(
             cs.status = "error"
             cs.error = err
             update_clip(clips_worksheet, clip.row_index, {"status": "error", "error": err})
-            continue
+            emit(EVT_CLIP_ERROR, {"clip_index": clip.clip_index, "error": err})
+            break
 
         # ── 3c. Submit to Kling ───────────────────────────────────────────
         try:
@@ -243,7 +269,8 @@ def run_producer_job(
             cs.status = "error"
             cs.error = err
             update_clip(clips_worksheet, clip.row_index, {"status": "error", "error": err})
-            continue
+            emit(EVT_CLIP_ERROR, {"clip_index": clip.clip_index, "error": err})
+            break
 
         # Persist task ID and frame URLs immediately (survivable on crash).
         update_clip(
@@ -276,7 +303,8 @@ def run_producer_job(
             cs.status = "error"
             cs.error = err
             update_clip(clips_worksheet, clip.row_index, {"status": "error", "error": err})
-            continue
+            emit(EVT_CLIP_ERROR, {"clip_index": clip.clip_index, "error": err})
+            break
 
         # ── 3e. Extract video URL ─────────────────────────────────────────
         try:
@@ -286,22 +314,66 @@ def run_producer_job(
             cs.status = "error"
             cs.error = err
             update_clip(clips_worksheet, clip.row_index, {"status": "error", "error": err})
-            continue
+            emit(EVT_CLIP_ERROR, {"clip_index": clip.clip_index, "error": err})
+            break
+
+        # ── 3e.5. Pronunciation fix (ElevenLabs TTS + Demucs + LipSync) ───
+        # Non-fatal: on any failure, log a warning and proceed with the
+        # original Kling video. The SceneLock chain is never affected because
+        # it always uses the pre-fix Cloudinary URL (step 3i).
+        if enable_pronunciation_fix and clip.dialogue:
+            emit(
+                EVT_PRONUNCIATION_START,
+                {"clip_index": clip.clip_index, "clip_key": clip.clip_key},
+            )
+            try:
+                fixed_url = apply_pronunciation_fix(
+                    kling_video_url=raw_video_url,
+                    dialogue=clip.dialogue,
+                    fal_queue=fal_queue,
+                    fal_ai=fal_ai,
+                    elevenlabs=elevenlabs,
+                    clip_key=clip.clip_key,
+                    poll_interval=poll_interval,
+                    max_poll_attempts=max_poll_attempts,
+                )
+                raw_video_url = fixed_url
+                emit(
+                    EVT_PRONUNCIATION_DONE,
+                    {"clip_index": clip.clip_index, "clip_key": clip.clip_key},
+                )
+                logger.info(
+                    "Pronunciation fix applied",
+                    extra={"clip_key": clip.clip_key, "fixed_url": fixed_url},
+                )
+            except Exception as exc:
+                warn = (
+                    f"[PronunciationFix clip={clip.clip_index}] {exc} "
+                    f"— using original Kling audio"
+                )
+                logger.warning(warn, extra={"clip_key": clip.clip_key})
+                emit(
+                    EVT_PRONUNCIATION_ERROR,
+                    {"clip_index": clip.clip_index, "error": warn},
+                )
 
         # ── 3f. Upload to Cloudinary ──────────────────────────────────────
         try:
-            uploaded_url = cloudinary_svc.upload_video(
+            upload_result = cloudinary_svc.upload_video(
                 raw_video_url,
                 folder=f"ai-generated/clips/{job.job_key}",
                 public_id=f"{job.job_key}_clip_{clip.clip_index}",
             )
+            uploaded_url = upload_result.url
+            actual_duration = upload_result.duration_s
         except Exception as exc:
             err = f"[CloudinaryUpload clip={clip.clip_index}] {exc}"
             logger.exception("Cloudinary clip upload failed", extra={"clip_key": clip.clip_key})
             cs.status = "error"
             cs.error = err
             update_clip(clips_worksheet, clip.row_index, {"status": "error", "error": err})
-            continue
+            emit(EVT_CLIP_ERROR, {"clip_index": clip.clip_index, "error": err})
+            break
 
         # ── 3g. Optionally add word-by-word captions ───────────────────────
         # The captioned clip is uploaded to Cloudinary so the URL is persistent
@@ -329,10 +401,14 @@ def run_producer_job(
                     captioned_fal_url,
                     folder=f"ai-generated/clips/{job.job_key}",
                     public_id=f"{job.job_key}_clip_{clip.clip_index}_captioned",
-                )
+                ).url
                 emit(
                     EVT_CAPTION_DONE,
-                    {"clip_index": clip.clip_index, "clip_key": clip.clip_key, "url": final_clip_url},
+                    {
+                        "clip_index": clip.clip_index,
+                        "clip_key": clip.clip_key,
+                        "url": final_clip_url,
+                    },
                 )
                 logger.info(
                     "Clip captioned",
@@ -361,7 +437,9 @@ def run_producer_job(
         # ── 3i. Chain last frame to next clip (always uses original) ───────
         # Use the pre-caption Cloudinary URL so Kling never receives a frame
         # with burned-in text as its SceneLock start-frame input.
-        clip_last_frame = build_last_frame_url(uploaded_url, clip.duration_s)
+        # Use the actual Cloudinary-reported duration (not the requested one)
+        # because Kling can produce clips shorter than requested.
+        clip_last_frame = build_last_frame_url(uploaded_url, actual_duration or clip.duration_s)
         last_frame_urls[clip.clip_index] = clip_last_frame
 
         next_clip = next((c for c in clips if c.clip_index == clip.clip_index + 1), None)
