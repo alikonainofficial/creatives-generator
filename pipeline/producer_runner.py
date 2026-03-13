@@ -13,6 +13,7 @@ from pipeline.clip_generator import (
     extract_video_url_from_kling_result,
     submit_clip_to_kling,
 )
+from services.caption_svc import add_captions
 from pipeline.video_blueprint import generate_blueprint, validate_blueprint
 from pipeline.video_stitcher import stitch_clips
 from services.cloudinary_svc import CloudinaryService
@@ -48,6 +49,10 @@ EVT_DRIVE_UPLOAD = "drive_upload"
 EVT_DRIVE_ERROR = "drive_error"
 EVT_DEMO_INJECT = "demo_inject"
 EVT_DEMO_SKIP = "demo_skip"
+EVT_CAPTION_START = "caption_start"
+EVT_CAPTION_POLL = "caption_poll"
+EVT_CAPTION_DONE = "caption_done"
+EVT_CAPTION_ERROR = "caption_error"
 EVT_JOB_DONE = "job_done"
 EVT_JOB_ERROR = "job_error"
 
@@ -80,15 +85,22 @@ def run_producer_job(
     progress_cb: ProgressCallback | None = None,
     poll_interval: int = 30,
     max_poll_attempts: int = 40,
+    enable_captions: bool = False,
 ) -> ProducerJobResult:
     """Run the complete producer pipeline for one job.
 
     Phases (mirrors n8n Producer v2):
       1. Validate / generate video blueprint
       2. Sequential clip generation (SceneLock frame chaining)
+      2.5. Optionally burn word-by-word captions into each generated clip
       3. Stitch clips via FAL FFmpeg
       4. Upload final video to Google Drive
       5. Write URLs + status back to sheet
+
+    When enable_captions=True, captions are applied to each Kling-generated clip before
+    stitching. The app demo clip (injected via _inject_demo_if_needed) is never captioned.
+    The SceneLock last-frame chain always uses the original (pre-caption) Cloudinary URL so
+    the face-swap anchor is not contaminated by burned-in text.
     """
     logger = get_logger(__name__, job_key=job.job_key)
     gemini = GeminiClient()
@@ -291,20 +303,64 @@ def run_producer_job(
             update_clip(clips_worksheet, clip.row_index, {"status": "error", "error": err})
             continue
 
-        # ── 3g. Mark clip done + update sheet ─────────────────────────────
+        # ── 3g. Optionally add word-by-word captions ───────────────────────
+        # The captioned clip is uploaded to Cloudinary so the URL is persistent
+        # across session boundaries (resumption after a failed stitch).
+        # The SceneLock last-frame chain always uses the original (pre-caption)
+        # uploaded_url so Kling never receives a frame with burned-in text.
+        final_clip_url = uploaded_url
+        if enable_captions:
+            emit(EVT_CAPTION_START, {"clip_index": clip.clip_index, "clip_key": clip.clip_key})
+
+            def _caption_poll_cb(attempt: int, status: str) -> None:
+                emit(
+                    EVT_CAPTION_POLL,
+                    {"clip_index": clip.clip_index, "attempt": attempt, "status": status},
+                )
+
+            try:
+                captioned_fal_url = add_captions(
+                    uploaded_url,
+                    fal_queue,
+                    on_poll=_caption_poll_cb,
+                )
+                # Re-upload captioned clip to Cloudinary for persistence.
+                final_clip_url = cloudinary_svc.upload_video(
+                    captioned_fal_url,
+                    folder=f"ai-generated/clips/{job.job_key}",
+                    public_id=f"{job.job_key}_clip_{clip.clip_index}_captioned",
+                )
+                emit(
+                    EVT_CAPTION_DONE,
+                    {"clip_index": clip.clip_index, "clip_key": clip.clip_key, "url": final_clip_url},
+                )
+                logger.info(
+                    "Clip captioned",
+                    extra={"clip_key": clip.clip_key, "captioned_url": final_clip_url},
+                )
+            except Exception as exc:
+                # Non-fatal: warn and fall back to the uncaptioned clip.
+                warn = f"[Caption clip={clip.clip_index}] {exc} — using uncaptioned clip"
+                logger.warning(warn, extra={"clip_key": clip.clip_key})
+                emit(EVT_CAPTION_ERROR, {"clip_index": clip.clip_index, "error": warn})
+                final_clip_url = uploaded_url
+
+        # ── 3h. Mark clip done + update sheet ─────────────────────────────
         cs.status = "done"
-        cs.clip_video_url = uploaded_url
+        cs.clip_video_url = final_clip_url
         update_clip(
             clips_worksheet,
             clip.row_index,
-            {"status": "done", "clip_video_url": uploaded_url},
+            {"status": "done", "clip_video_url": final_clip_url},
         )
         emit(
             EVT_CLIP_DONE,
-            {"clip_index": clip.clip_index, "clip_key": clip.clip_key, "url": uploaded_url},
+            {"clip_index": clip.clip_index, "clip_key": clip.clip_key, "url": final_clip_url},
         )
 
-        # ── 3h. Chain last frame to next clip ─────────────────────────────
+        # ── 3i. Chain last frame to next clip (always uses original) ───────
+        # Use the pre-caption Cloudinary URL so Kling never receives a frame
+        # with burned-in text as its SceneLock start-frame input.
         clip_last_frame = build_last_frame_url(uploaded_url, clip.duration_s)
         last_frame_urls[clip.clip_index] = clip_last_frame
 

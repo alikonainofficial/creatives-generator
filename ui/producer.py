@@ -13,6 +13,10 @@ from logging_config import get_logger, setup_logging
 from pipeline.producer_runner import (
     EVT_BLUEPRINT,
     EVT_BLUEPRINT_READY,
+    EVT_CAPTION_DONE,
+    EVT_CAPTION_ERROR,
+    EVT_CAPTION_POLL,
+    EVT_CAPTION_START,
     EVT_CLIP_DONE,
     EVT_CLIP_ERROR,
     EVT_CLIP_POLL,
@@ -68,8 +72,9 @@ For every job with `status = generating` in your sheet it:
 1. Validates (or generates) the video blueprint — a frame-chained plan for all clips.
 2. Loads clip rows from the **Clips** tab.
 3. Submits each clip to **Kling AI** sequentially, polling until complete.
-4. Optionally injects an **app demo** clip at a configured position.
-5. Stitches all clips into a single video via **FAL FFmpeg**.
+4. Optionally burns **word-by-word captions** into each generated clip (not the app demo).
+5. Optionally injects an **app demo** clip at a configured position.
+6. Stitches all clips into a single video via **FAL FFmpeg**.
 6. Uploads the final video to **Google Drive** and writes the Drive URL back to the sheet.
 7. Marks the job `done`.
 
@@ -165,6 +170,16 @@ For every job with `status = generating` in your sheet it:
                     "Clips within a single job are still generated sequentially."
                 ),
             )
+            enable_captions = st.checkbox(
+                "Add captions",
+                value=False,
+                help=(
+                    "Burn word-by-word captions into each generated video clip. "
+                    "One word is shown at a time, synchronized to speech (white bold text, "
+                    "black stroke). Adds ~15–30 s per clip. "
+                    "The app demo clip is never captioned."
+                ),
+            )
 
         submitted = st.form_submit_button("▶ Start Production", type="primary")
 
@@ -244,6 +259,7 @@ For every job with `status = generating` in your sheet it:
     _demo_tab = demo_tab.strip()
     _drive_folder_id = drive_folder_id.strip()
     _poll_interval = int(poll_interval)
+    _enable_captions = bool(enable_captions)
 
     def _run_worker(job: GeneratingJob) -> ProducerJobResult:
         """Process one job end-to-end with its own isolated gspread connections.
@@ -268,6 +284,7 @@ For every job with `status = generating` in your sheet it:
                 progress_cb=lambda jk, et, d: event_queue.put((jk, et, d)),
                 poll_interval=_poll_interval,
                 max_poll_attempts=40,
+                enable_captions=_enable_captions,
             )
         except Exception as exc:
             result = ProducerJobResult(
@@ -414,6 +431,28 @@ def _apply_event(
 
     elif event_type == EVT_CLIP_ERROR:
         log.append(f"[{ts}] {job_key} — clip error: {data}")
+
+    elif event_type == EVT_CAPTION_START:
+        idx = data.get("clip_index", "?") if isinstance(data, dict) else "?"
+        state["current_step"] = f"Captioning clip {idx}"
+        log.append(f"[{ts}] {job_key} — captioning clip {idx}")
+
+    elif event_type == EVT_CAPTION_POLL:
+        if isinstance(data, dict):
+            state["current_step"] = (
+                f"Caption clip {data.get('clip_index')} — poll {data.get('attempt')} "
+                f"({data.get('status')})"
+            )
+
+    elif event_type == EVT_CAPTION_DONE:
+        idx = data.get("clip_index", "?") if isinstance(data, dict) else "?"
+        log.append(f"[{ts}] {job_key} — clip {idx} captioned")
+
+    elif event_type == EVT_CAPTION_ERROR:
+        if isinstance(data, dict):
+            log.append(f"[{ts}] {job_key} — ⚠ caption warning: {data.get('error', data)}")
+        else:
+            log.append(f"[{ts}] {job_key} — ⚠ caption warning: {data}")
 
     elif event_type == EVT_DEMO_INJECT:
         demo_id = data.get("demo_id", "?") if isinstance(data, dict) else "?"
