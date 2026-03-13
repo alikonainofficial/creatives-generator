@@ -39,7 +39,7 @@ class GoogleDriveService:
         start = time.time()
         self._logger.info("Downloading video for Drive upload", extra={"video_url": video_url})
 
-        with httpx.Client(follow_redirects=True, timeout=300.0) as client:
+        with httpx.Client(follow_redirects=True, timeout=300.0, transport=httpx.HTTPTransport(retries=3)) as client:
             resp = client.get(video_url)
             resp.raise_for_status()
             content = resp.content

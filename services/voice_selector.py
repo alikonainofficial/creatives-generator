@@ -45,7 +45,7 @@ def get_my_voices(api_key: str) -> list[dict[str, Any]]:
         return _catalog_cache[0]
 
     _logger.info("Fetching ElevenLabs voice catalog from API")
-    with httpx.Client(timeout=30.0) as client:
+    with httpx.Client(timeout=30.0, transport=httpx.HTTPTransport(retries=3)) as client:
         resp = client.get(
             f"{_BASE_URL}/v1/voices",
             headers={"xi-api-key": api_key},
@@ -143,7 +143,7 @@ def select_voice_for_subject(
         "Voice selected for subject",
         extra={
             "voice_id": result.voice_id,
-            "name": result.name,
+            "voice_name": result.name,
             "gender_filter": gender,
             "candidates": len(candidates),
         },

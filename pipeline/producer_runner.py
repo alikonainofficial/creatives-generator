@@ -216,7 +216,7 @@ def run_producer_job(
                 extra={
                     "job_key": job.job_key,
                     "voice_id": voice_result.voice_id,
-                    "name": voice_result.name,
+                    "voice_name": voice_result.name,
                 },
             )
         else:
@@ -381,6 +381,7 @@ def run_producer_job(
                     fal_queue=fal_queue,
                     fal_ai=fal_ai,
                     elevenlabs=elevenlabs,
+                    cloudinary_svc=cloudinary_svc,
                     clip_key=clip.clip_key,
                     poll_interval=poll_interval,
                     max_poll_attempts=max_poll_attempts,

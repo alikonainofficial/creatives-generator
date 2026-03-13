@@ -83,7 +83,7 @@ class ElevenLabsClient:
             },
         )
 
-        with httpx.Client(timeout=60.0) as client:
+        with httpx.Client(timeout=60.0, transport=httpx.HTTPTransport(retries=3)) as client:
             resp = client.post(
                 url,
                 headers=headers,

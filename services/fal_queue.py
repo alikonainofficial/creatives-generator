@@ -36,7 +36,7 @@ class FalQueueClient:
         """Submit a job to the FAL queue and return status/response URLs."""
         url = f"{self.BASE_URL}/{model}"
         start = time.time()
-        with httpx.Client(timeout=60.0) as client:
+        with httpx.Client(timeout=60.0, transport=httpx.HTTPTransport(retries=3)) as client:
             resp = client.post(url, headers=self._headers, json=arguments)
             resp.raise_for_status()
             data = resp.json()
@@ -58,14 +58,14 @@ class FalQueueClient:
 
     def poll_status(self, status_url: str) -> dict[str, Any]:
         """Check the current status of a queued job."""
-        with httpx.Client(timeout=30.0) as client:
+        with httpx.Client(timeout=30.0, transport=httpx.HTTPTransport(retries=3)) as client:
             resp = client.get(status_url, headers=self._headers)
             resp.raise_for_status()
         return resp.json()
 
     def get_result(self, response_url: str) -> dict[str, Any]:
         """Fetch the completed result from the response URL."""
-        with httpx.Client(timeout=60.0) as client:
+        with httpx.Client(timeout=60.0, transport=httpx.HTTPTransport(retries=3)) as client:
             resp = client.get(response_url, headers=self._headers)
             resp.raise_for_status()
         return resp.json()

@@ -218,7 +218,7 @@ class GeminiClient:
             "Gemini voice selection completed",
             extra={
                 "voice_id": data.get("voice_id"),
-                "name": data.get("name"),
+                "voice_name": data.get("name"),
                 "duration_seconds": round(elapsed, 2),
             },
         )

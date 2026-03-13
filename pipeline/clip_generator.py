@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import fal_client
 import httpx
 
 from logging_config import get_logger
@@ -237,7 +236,7 @@ def build_last_frame_url(clip_video_url: str, duration_s: float) -> str:
     Port of the n8n 'Build Next Clip Start Frame URL' node.
     Injects `so_<time>` after `/video/upload/` and swaps the extension to .jpg.
     """
-    last_time = max(0.1, duration_s - 0.1)
+    last_time = round(max(0.1, duration_s - 0.1), 1)
     injected = clip_video_url.replace("/video/upload/", f"/video/upload/so_{last_time}/")
     last_frame_url = re.sub(
         r"\.(mp4|mov|webm|mkv|avi)(\?.*)?$",
@@ -257,6 +256,7 @@ def apply_pronunciation_fix(
     fal_queue: FalQueueClient,
     fal_ai: "FalAiClient",
     elevenlabs: "ElevenLabsClient",
+    cloudinary_svc: "CloudinaryService",
     clip_key: str = "",
     poll_interval: int = _LIPSYNC_POLL_INTERVAL,
     max_poll_attempts: int = _LIPSYNC_MAX_ATTEMPTS,
@@ -266,19 +266,26 @@ def apply_pronunciation_fix(
 
     Pipeline:
       1. Download Kling video → extract audio track (local ffmpeg)
-      2. Upload audio → fal Demucs → separate vocals from ambient background
-      3. ElevenLabs TTS (with SSML phoneme control) → upload to fal storage
+      2. Upload audio to Cloudinary → fal Demucs → separate vocals from ambient background
+      3. ElevenLabs TTS → upload to Cloudinary
       4. Kling LipSync (original video + TTS audio) → lip-synced video
       5. Merge non-vocal background stems → mix with TTS (sidechain ducking)
-      6. Replace audio on lip-synced video → upload to fal storage → return URL
+      6. Replace audio on lip-synced video → upload to Cloudinary → return URL
+
+    Intermediate files are uploaded to Cloudinary (persistent, publicly
+    accessible) instead of FAL ephemeral storage to avoid DNS/CDN
+    reliability issues with fal_client uploads.
 
     Requires ffmpeg to be installed and on PATH.
     Raises on hard failures — callers should wrap in try/except and fall back
     to the original kling_video_url if desired.
     """
     # Lazy imports to avoid circular deps at module load time.
-    from services.elevenlabs import ElevenLabsClient  # noqa: F401 (type check only)
-    from services.fal_ai import FalAiClient  # noqa: F401 (type check only)
+    from services.cloudinary_svc import CloudinaryService  # noqa: F401
+    from services.elevenlabs import ElevenLabsClient  # noqa: F401
+    from services.fal_ai import FalAiClient  # noqa: F401
+
+    upload_folder = f"ai-generated/pronunciation-fix/{clip_key}" if clip_key else "ai-generated/pronunciation-fix"
 
     _logger.info(
         "Applying pronunciation fix",
@@ -297,8 +304,10 @@ def apply_pronunciation_fix(
         _ffmpeg(["-i", str(video_path), "-vn", "-q:a", "0", str(audio_path)])
 
         # ── 2. Demucs stem separation ─────────────────────────────────────────
-        audio_fal_url: str = fal_client.upload_file(str(audio_path))
-        all_stems = fal_ai.demucs_separate(audio_fal_url)
+        audio_url = cloudinary_svc.upload_media_file(
+            str(audio_path), folder=upload_folder, public_id=f"{clip_key}_kling_audio" if clip_key else None,
+        )
+        all_stems = fal_ai.demucs_separate(audio_url)
         bg_stem_urls = {k: v for k, v in all_stems.items() if k in _BACKGROUND_STEMS}
 
         _logger.info(
@@ -311,13 +320,18 @@ def apply_pronunciation_fix(
         )
 
         # ── 3. ElevenLabs TTS ─────────────────────────────────────────────────
-        tts_fal_url = elevenlabs.text_to_speech_and_upload(dialogue, voice_id=voice_id)
+        tts_bytes = elevenlabs.text_to_speech(dialogue, voice_id=voice_id)
+        tts_path = tmp / "tts.mp3"
+        tts_path.write_bytes(tts_bytes)
+        tts_url = cloudinary_svc.upload_media_file(
+            str(tts_path), folder=upload_folder, public_id=f"{clip_key}_tts" if clip_key else None,
+        )
 
         # ── 4. Kling LipSync ──────────────────────────────────────────────────
         _logger.info("Submitting Kling LipSync job", extra={"clip_key": clip_key})
         lipsync_submit = fal_queue.submit(
             KLING_LIPSYNC_MODEL,
-            {"video_url": kling_video_url, "audio_url": tts_fal_url},
+            {"video_url": kling_video_url, "audio_url": tts_url},
         )
         lipsync_result = fal_queue.wait_for_completion(
             lipsync_submit,
@@ -330,9 +344,6 @@ def apply_pronunciation_fix(
         # ── 5 & 6. Download, mix audio, replace on video ──────────────────────
         lipsync_path = tmp / "lipsync.mp4"
         _download_to_file(lipsync_url, lipsync_path)
-
-        tts_path = tmp / "tts.mp3"
-        _download_to_file(tts_fal_url, tts_path)
 
         final_path = tmp / "final.mp4"
 
@@ -347,24 +358,25 @@ def apply_pronunciation_fix(
             _merge_audio_stems(stem_paths, bg_path)
             _mix_tts_and_background(lipsync_path, tts_path, bg_path, final_path)
         else:
-            # No separable background found — just replace with clean TTS.
             _replace_audio(lipsync_path, tts_path, final_path)
 
-        # ── Upload final video to fal ephemeral storage ───────────────────────
-        final_fal_url: str = fal_client.upload_file(str(final_path))
+        # ── Upload final video to Cloudinary ──────────────────────────────────
+        final_url = cloudinary_svc.upload_media_file(
+            str(final_path), folder=upload_folder, public_id=f"{clip_key}_fixed" if clip_key else None,
+        )
 
         _logger.info(
             "Pronunciation fix complete",
-            extra={"clip_key": clip_key, "final_url": final_fal_url},
+            extra={"clip_key": clip_key, "final_url": final_url},
         )
-        return final_fal_url
+        return final_url
 
 
 # ── Private helpers ───────────────────────────────────────────────────────────
 
 
 def _download_to_file(url: str, dest: Path) -> None:
-    with httpx.Client(timeout=180.0, follow_redirects=True) as client:
+    with httpx.Client(timeout=180.0, follow_redirects=True, transport=httpx.HTTPTransport(retries=3)) as client:
         resp = client.get(url)
         resp.raise_for_status()
     dest.write_bytes(resp.content)
