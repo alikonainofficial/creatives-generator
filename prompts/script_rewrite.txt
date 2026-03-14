@@ -30,13 +30,13 @@ Preserve:
 
 SEGMENT COUNT RULE
 
-Target 2–4 dialogue segments.
+Target 2–{{ max_segments }} dialogue segments.
 
-Never exceed 4 segments.
+Never exceed {{ max_segments }} segments.
 
 VIDEO LENGTH CONSTRAINT (MANDATORY)
 
-The final generated video must be no longer than 20 seconds total spoken duration.
+The final generated video must be no longer than {{ target_duration_s }} seconds total spoken duration.
 
 Assume each dialogue segment will be spoken naturally.
 
@@ -44,12 +44,12 @@ Estimate timing naturally based on normal speech pace.
 
 Guidelines:
 • Typical speaking speed ≈ 2–3 words per second
-• Keep total word count appropriate for a video under 20 seconds
+• Keep total word count appropriate for a video under {{ target_duration_s }} seconds
 • Do not generate an overly long script
 
 Target total length:
-• Ideal: 14–18 seconds
-• Maximum: 20 seconds
+• Ideal: {{ ideal_min_s }}–{{ ideal_max_s }} seconds
+• Maximum: {{ target_duration_s }} seconds
 
 The script must feel naturally paced and not rushed.
 
@@ -59,10 +59,10 @@ TOTAL WORD LIMIT (MANDATORY)
 
 The entire script must stay within:
 
-Minimum: 30 words
-Maximum: 45 words
+Minimum: {{ min_words }} words
+Maximum: {{ max_words }} words
 
-Never exceed 45 words total across all segments.
+Never exceed {{ max_words }} words total across all segments.
 
 LINE LENGTH RULE (MANDATORY)
 

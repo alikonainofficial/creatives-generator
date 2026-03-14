@@ -11,7 +11,7 @@ from logging_config import get_logger
 from pipeline.clip_timing import TimedClip, assign_clip_durations
 from pipeline.json_utils import extract_json
 from pipeline.runner import StepResult
-from pipeline.script_writer import RewrittenScript, ScriptSegment
+from pipeline.script_writer import RewrittenScript, ScriptSegment, compute_script_limits
 from pipeline.video_blueprint import generate_blueprint_from_persona
 from services.gemini import GeminiClient
 
@@ -19,6 +19,8 @@ from services.gemini import GeminiClient
 PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "persona_script.txt"
 
 ProgressCallback = Callable[[str, str], None]  # (step_name, message)
+
+_module_logger = get_logger(__name__)
 
 
 @dataclass
@@ -88,9 +90,22 @@ def _rewrite_persona_script(
     gender: str,
     scene_description: str,
     gemini: GeminiClient,
+    target_duration_s: int = 20,
 ) -> RewrittenScript:
     """Call Gemini to write a Speechify script from persona context."""
     prompt_template = PROMPT_PATH.read_text()
+
+    limits = compute_script_limits(target_duration_s)
+    _module_logger.info(
+        "Persona script rewrite started",
+        extra={
+            "job_key": job.job_key,
+            "target_duration_s": target_duration_s,
+            "max_words": limits["max_words"],
+            "min_words": limits["min_words"],
+            "max_segments": limits["max_segments"],
+        },
+    )
 
     persona_json = json.dumps(
         {
@@ -104,6 +119,12 @@ def _rewrite_persona_script(
 
     prompt = (
         prompt_template
+        .replace("{{ target_duration_s }}", str(limits["target_duration_s"]))
+        .replace("{{ max_words }}", str(limits["max_words"]))
+        .replace("{{ min_words }}", str(limits["min_words"]))
+        .replace("{{ ideal_min_s }}", str(limits["ideal_min_s"]))
+        .replace("{{ ideal_max_s }}", str(limits["ideal_max_s"]))
+        .replace("{{ max_segments }}", str(limits["max_segments"]))
         .replace("{{ persona_json }}", persona_json)
         .replace("{{ hook_sample }}", job.hook_sample)
         .replace("{{ hook_emotion }}", job.hook_emotion)
@@ -145,6 +166,17 @@ def _rewrite_persona_script(
                 )
             )
         total_word_count = sum(len(s.dialogue.split()) for s in segments)
+        _module_logger.info(
+            "Persona script rewrite completed",
+            extra={
+                "job_key": job.job_key,
+                "target_duration_s": target_duration_s,
+                "total_word_count": total_word_count,
+                "max_words": limits["max_words"],
+                "within_limit": total_word_count <= limits["max_words"],
+                "segments_count": len(segments),
+            },
+        )
         return RewrittenScript(segments=segments, total_word_count=total_word_count)
 
     try:
@@ -159,6 +191,7 @@ def _rewrite_persona_script(
 def run_persona_pipeline(
     job: PersonaJobInput,
     progress_cb: ProgressCallback | None = None,
+    target_duration_s: int = 20,
 ) -> PersonaPipelineResult:
     """Run the persona-based pipeline for a single persona row.
 
@@ -181,7 +214,10 @@ def run_persona_pipeline(
         persona_image_url=job.persona_image_url,
     )
 
-    logger.info("Starting persona pipeline", extra={"job_key": job.job_key})
+    logger.info(
+        "Starting persona pipeline",
+        extra={"job_key": job.job_key, "target_duration_s": target_duration_s},
+    )
     gemini = GeminiClient()
 
     # Step 1: Analyze persona image (gender + scene description)
@@ -209,6 +245,7 @@ def run_persona_pipeline(
                 result.gender or "unknown",
                 result.scene_description or "",
                 gemini,
+                target_duration_s=target_duration_s,
             ),
             progress_cb,
         )
@@ -261,8 +298,10 @@ def run_persona_pipeline(
         "Persona pipeline completed successfully",
         extra={
             "job_key": job.job_key,
-            "total_duration_seconds": result.total_duration,
+            "target_duration_s": target_duration_s,
+            "script_word_count": result.script.total_word_count if result.script else 0,
             "clips_count": len(result.clips),
+            "total_duration_seconds": result.total_duration,
         },
     )
     return result

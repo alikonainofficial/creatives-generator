@@ -17,6 +17,28 @@ PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "script_rewrite.txt"
 logger = logging.getLogger(__name__)
 
 
+def compute_script_limits(target_duration_s: int) -> dict[str, int]:
+    """Derive Gemini prompt constraints from a target spoken duration.
+
+    The formula is calibrated so that target_duration_s=20 reproduces the
+    original hardcoded values exactly:
+      max_words=45, min_words=30, ideal_min_s=14, ideal_max_s=18, max_segments=4
+    """
+    max_words = max(15, int(target_duration_s * 2.25))
+    min_words = max(10, int(target_duration_s * 1.50))
+    ideal_max_s = max(8, int(target_duration_s * 0.90))
+    ideal_min_s = max(5, int(target_duration_s * 0.70))
+    max_segments = max(2, min(6, round(target_duration_s / 5)))
+    return {
+        "target_duration_s": target_duration_s,
+        "max_words": max_words,
+        "min_words": min_words,
+        "ideal_min_s": ideal_min_s,
+        "ideal_max_s": ideal_max_s,
+        "max_segments": max_segments,
+    }
+
+
 class ScriptSegment(BaseModel):
     segment_id: int
     dialogue: str
@@ -38,9 +60,21 @@ def rewrite_script(
     gender: str,
     analysis: VideoAnalysisResult,
     gemini: GeminiClient,
+    target_duration_s: int = 20,
 ) -> RewrittenScript:
     """Call Gemini to rewrite the script for Speechify branding."""
     prompt_template = PROMPT_PATH.read_text()
+
+    limits = compute_script_limits(target_duration_s)
+    logger.info(
+        "Script rewrite started",
+        extra={
+            "target_duration_s": target_duration_s,
+            "max_words": limits["max_words"],
+            "min_words": limits["min_words"],
+            "max_segments": limits["max_segments"],
+        },
+    )
 
     # Build JSON payloads expected by the prompt template.
     video_format_summary_json = json.dumps(
@@ -59,6 +93,12 @@ def rewrite_script(
     # Avoid str.format() here because the prompt contains literal JSON braces.
     prompt = (
         prompt_template
+        .replace("{{ target_duration_s }}", str(limits["target_duration_s"]))
+        .replace("{{ max_words }}", str(limits["max_words"]))
+        .replace("{{ min_words }}", str(limits["min_words"]))
+        .replace("{{ ideal_min_s }}", str(limits["ideal_min_s"]))
+        .replace("{{ ideal_max_s }}", str(limits["ideal_max_s"]))
+        .replace("{{ max_segments }}", str(limits["max_segments"]))
         .replace("{{ video_format_summary_json }}", video_format_summary_json)
         .replace("{{ spoken_dialogue_json }}", spoken_dialogue_json)
         .replace("{{ static_on_screen_text_json }}", static_on_screen_text_json)
@@ -109,6 +149,16 @@ def rewrite_script(
             )
 
         total_word_count = sum(len(s.dialogue.split()) for s in segments)
+        logger.info(
+            "Script rewrite completed",
+            extra={
+                "target_duration_s": target_duration_s,
+                "total_word_count": total_word_count,
+                "max_words": limits["max_words"],
+                "within_limit": total_word_count <= limits["max_words"],
+                "segments_count": len(segments),
+            },
+        )
         return RewrittenScript(segments=segments, total_word_count=total_word_count)
 
     # Fallback: assume the JSON already matches the RewrittenScript schema.

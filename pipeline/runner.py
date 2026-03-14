@@ -89,6 +89,7 @@ def run_pipeline(
     video_cache: dict,
     progress_cb: ProgressCallback | None = None,
     regenerate_image_only: bool = False,
+    target_duration_s: int = 20,
 ) -> PipelineResult:
     """Run the video cloning pipeline for a single job.
 
@@ -107,6 +108,7 @@ def run_pipeline(
         source_video_url=source_video_url,
         reference_image_url=reference_image_url,
         regenerate_image_only=regenerate_image_only,
+        target_duration_s=target_duration_s,
     )
 
     gemini = GeminiClient()
@@ -333,10 +335,29 @@ def run_pipeline(
     # reference images for the same source video can reuse the same script.
     # For backward compatibility with older cache entries, we also look for
     # a script stored under the per-reference image bucket.
+    # Invalidate the cached script when target_duration_s differs from the
+    # duration used to generate it (legacy entries without a stored duration
+    # default to 20 seconds to match the original hardcoded behaviour).
     cached_script = cache_entry.get("script") or ref_entry.get("script")
+    cached_duration = cache_entry.get("script_target_duration_s", 20)
+    duration_mismatch = bool(cached_script and cached_duration != target_duration_s)
+    if duration_mismatch:
+        logger.warning(
+            "Script cache invalidated — target duration changed",
+            extra={
+                "cached_duration_s": cached_duration,
+                "target_duration_s": target_duration_s,
+            },
+        )
+        cached_script = None
     logger.info(
         "Script cache check",
-        extra={"cache_hit": cached_script is not None},
+        extra={
+            "cache_hit": cached_script is not None,
+            "cached_duration_s": cached_duration,
+            "target_duration_s": target_duration_s,
+            "duration_mismatch": duration_mismatch,
+        },
     )
 
     if cached_script:
@@ -361,6 +382,7 @@ def run_pipeline(
                     result.gender or "unknown",
                     analysis,
                     gemini,
+                    target_duration_s=target_duration_s,
                 ),
                 progress_cb,
             )
@@ -369,6 +391,7 @@ def run_pipeline(
             # the same source video (even with different reference images)
             # reuse the same script instead of regenerating it.
             cache_entry["script"] = script
+            cache_entry["script_target_duration_s"] = target_duration_s
             # Also persist on the reference image entry to gracefully handle
             # any legacy callers that still expect script there.
             ref_entry["script"] = script
@@ -398,6 +421,9 @@ def run_pipeline(
         extra={
             "total_duration_seconds": result.total_duration,
             "steps_count": len(result.steps),
+            "target_duration_s": target_duration_s,
+            "script_word_count": result.script.total_word_count if result.script else 0,
+            "clips_count": len(result.clips),
         },
     )
     return result

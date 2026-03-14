@@ -135,6 +135,18 @@ so future runs stay fast.
         jobs_tab = st.text_input("Jobs Tab Name", value="Jobs")
         clips_tab = st.text_input("Clips Tab Name", value="Clips")
         cache_tab = st.text_input("VideoCache Tab Name (optional)", value="VideoCache")
+        target_duration_s = st.number_input(
+            "Target video length (seconds, excluding app demo)",
+            min_value=10,
+            max_value=60,
+            value=20,
+            step=5,
+            help=(
+                "The desired spoken duration of the generated script, excluding the app demo cutaway. "
+                "Controls word count limits and segment count passed to Gemini. "
+                "Default (20s) matches the original behaviour."
+            ),
+        )
         num_workers = st.number_input(
             "Parallel workers",
             min_value=1,
@@ -165,6 +177,7 @@ so future runs stay fast.
             "clips_tab": clips_tab.strip(),
             "cache_tab": cache_tab.strip(),
             "num_workers": int(num_workers),
+            "target_duration_s": int(target_duration_s),
         },
     )
 
@@ -241,6 +254,7 @@ so future runs stay fast.
     _cache_tab = cache_tab.strip() if cache_ws_available else ""
     _shared_cache = video_cache
     _cache_lock = cache_lock
+    _target_duration_s = int(target_duration_s)
 
     def _run_worker(job: SheetJob) -> None:
         """Process one Clone Batch job with its own isolated gspread connections."""
@@ -284,6 +298,7 @@ so future runs stay fast.
                 reference_image_url=job.reference_image_url,
                 video_cache=local_cache,
                 progress_cb=progress_cb,
+                target_duration_s=_target_duration_s,
             )
 
             try:
