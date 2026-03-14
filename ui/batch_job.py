@@ -1,29 +1,49 @@
 from __future__ import annotations
 
-import asyncio
-import json
+import queue
 import threading
 import time
+import traceback
 from typing import Any
 
 import streamlit as st
-import traceback
 
 from cache import get_session_cache, load_sheet_cache, save_to_sheet_cache
 from logging_config import get_logger, setup_logging
+from pipeline.parallel_runner import (
+    DEFAULT_BATCH_WORKERS,
+    MAX_BATCH_WORKERS,
+    EVT_ALL_DONE,
+    EVT_JOB_PROGRESS,
+    EVT_JOB_RESULT,
+    EVT_JOB_START,
+    BatchWorkerResult,
+    ParallelBatchRunner,
+)
 from pipeline.runner import PipelineResult, run_pipeline
 from sheets.auth import get_gspread_client
-from sheets.reader import read_queued_jobs, get_worksheet
-from sheets.writer import write_job_result, update_job_status
+from sheets.reader import SheetJob, get_worksheet, read_queued_jobs
+from sheets.writer import update_job_status, write_job_result
 
 
 logger = get_logger(__name__, ui_mode="batch")
+
+# ── Session-state keys ────────────────────────────────────────────────────────
+_KEY_RUNNING = "batch_running"
+_KEY_QUEUE = "batch_event_queue"
+_KEY_JOB_STATES = "batch_job_states"
+_KEY_JOB_MAP = "batch_job_map"          # job_key → SheetJob (for post-run summary)
+_KEY_LOG = "batch_log"
+_KEY_RESULTS = "batch_results"          # list[BatchWorkerResult]
 
 
 def render() -> None:
     setup_logging()
     st.header("Clone Batch")
-    st.caption("Analyze source videos, swap faces from a reference image, and generate scripts — in bulk via Google Sheet.")
+    st.caption(
+        "Analyze source videos, swap faces from a reference image, and generate scripts — "
+        "in bulk via Google Sheet."
+    )
 
     with st.expander("ℹ️ How this works & what to prepare", expanded=False):
         st.markdown(
@@ -82,6 +102,31 @@ so future runs stay fast.
             """
         )
 
+    # Handle any pending image-only regeneration before routing so that results
+    # are reflected on the same render cycle.
+    regen_target_row = st.session_state.pop("batch_regen_target_row", None)
+    if regen_target_row is not None:
+        sheet_ctx = st.session_state.get("batch_last_sheet_context")
+        completed_jobs: list[dict[str, Any]] | None = st.session_state.get(
+            "batch_last_completed_jobs"
+        )
+        if isinstance(sheet_ctx, dict) and isinstance(completed_jobs, list):
+            job = next(
+                (j for j in completed_jobs if j.get("row_index") == regen_target_row), None
+            )
+            if job is not None:
+                st.session_state["batch_regen_in_progress"] = True
+                try:
+                    _regenerate_single_batch_job_image(job, sheet_ctx)
+                finally:
+                    st.session_state["batch_regen_in_progress"] = False
+
+    # ── Active run ────────────────────────────────────────────────────────────
+    if st.session_state.get(_KEY_RUNNING):
+        _render_active_run()
+        return
+
+    # ── Config form ───────────────────────────────────────────────────────────
     with st.form("batch_form"):
         sheet_url = st.text_input(
             "Google Sheet URL or ID",
@@ -90,234 +135,367 @@ so future runs stay fast.
         jobs_tab = st.text_input("Jobs Tab Name", value="Jobs")
         clips_tab = st.text_input("Clips Tab Name", value="Clips")
         cache_tab = st.text_input("VideoCache Tab Name (optional)", value="VideoCache")
+        num_workers = st.number_input(
+            "Parallel workers",
+            min_value=1,
+            max_value=MAX_BATCH_WORKERS,
+            value=DEFAULT_BATCH_WORKERS,
+            step=1,
+            help=(
+                f"Number of jobs to process simultaneously (1–{MAX_BATCH_WORKERS}). "
+                "Each worker opens its own API connections. "
+                "Increase for large batches; keep at 1 to process sequentially."
+            ),
+        )
         submitted = st.form_submit_button("Load & Process Queued Jobs", type="primary")
 
-    if submitted:
-        if not sheet_url.strip():
-            st.error("Please enter a Google Sheet URL or ID.")
-            return
+    if not submitted:
+        _render_batch_review_section()
+        return
 
-        logger.info(
-            "Batch submission received",
-            extra={
-                "sheet_url_or_id": sheet_url.strip(),
-                "jobs_tab": jobs_tab.strip(),
-                "clips_tab": clips_tab.strip(),
-                "cache_tab": cache_tab.strip(),
-            },
-        )
+    if not sheet_url.strip():
+        st.error("Please enter a Google Sheet URL or ID.")
+        return
 
-        # Connect to sheet
-        try:
-            client = get_gspread_client()
-
-            sheet_id = sheet_url.strip()
-            if "spreadsheets/d/" in sheet_id:
-                sheet_id = sheet_id.split("spreadsheets/d/")[1].split("/")[0]
-
-            spreadsheet = client.open_by_key(sheet_id)
-            jobs_ws = get_worksheet(spreadsheet, jobs_tab.strip())
-
-            try:
-                clips_ws = get_worksheet(spreadsheet, clips_tab.strip())
-            except ValueError:
-                clips_ws = None
-                st.warning(
-                    f"Clips tab '{clips_tab}' not found — clips will not be written to sheet."
-                )
-
-            # Load video cache from sheet if available
-            video_cache = get_session_cache()
-            try:
-                cache_ws = get_worksheet(spreadsheet, cache_tab.strip())
-                sheet_cache = load_sheet_cache(cache_ws)
-                video_cache.update(sheet_cache)
-                st.info(f"Loaded {len(sheet_cache)} cached entries from VideoCache tab.")
-            except ValueError:
-                cache_ws = None
-
-            jobs = read_queued_jobs(jobs_ws)
-
-        except Exception as e:
-            # Surface full exception details so debugging is easier.
-            logger.exception(
-                "Failed to connect to Google Sheet",
-                extra={"sheet_id": sheet_id},
-            )
-            st.error("Failed to connect to Google Sheet:")
-            st.exception(e)
-            # Also print full traceback to the server logs for deeper inspection.
-            traceback.print_exc()
-            return
-
-        if not jobs:
-            st.info("No queued jobs found in the sheet.")
-            return
-
-        st.info(f"Found {len(jobs)} queued job(s). Starting processing...")
-
-        # Live status table
-        job_statuses = {job.row_index: {"url": job.source_video_url, "status": "pending", "error": ""} for job in jobs}
-
-        status_placeholder = st.empty()
-
-        def render_status_table() -> None:
-            rows = []
-            for row_idx, info in job_statuses.items():
-                rows.append({
-                    "Row": row_idx,
-                    "Video": info["url"][-60:] if len(info["url"]) > 60 else info["url"],
-                    "Status": info["status"],
-                    "Error": info["error"],
-                })
-            status_placeholder.dataframe(rows, width="stretch")
-
-        render_status_table()
-
-        # Persist the sheet context so we can later regenerate images for specific
-        # rows without re-running the entire batch.
-        st.session_state["batch_last_sheet_context"] = {
-            "sheet_id": sheet_id,
+    logger.info(
+        "Batch submission received",
+        extra={
+            "sheet_url_or_id": sheet_url.strip(),
             "jobs_tab": jobs_tab.strip(),
             "clips_tab": clips_tab.strip(),
             "cache_tab": cache_tab.strip(),
-        }
+            "num_workers": int(num_workers),
+        },
+    )
 
-        completed_jobs: list[dict[str, Any]] = []
+    # ── Connect + discover jobs ───────────────────────────────────────────────
+    try:
+        client = get_gspread_client()
 
-        # Process jobs sequentially (can extend to parallel later)
-        for job in jobs:
-            logger.info(
-                "Starting batch job row",
-                extra={
-                    "row_index": job.row_index,
-                    "source_video_url": job.source_video_url,
-                    "reference_image_url": job.reference_image_url,
-                },
+        sheet_id = sheet_url.strip()
+        if "spreadsheets/d/" in sheet_id:
+            sheet_id = sheet_id.split("spreadsheets/d/")[1].split("/")[0]
+
+        spreadsheet = client.open_by_key(sheet_id)
+        jobs_ws = get_worksheet(spreadsheet, jobs_tab.strip())
+
+        try:
+            get_worksheet(spreadsheet, clips_tab.strip())
+        except ValueError:
+            st.warning(
+                f"Clips tab '{clips_tab}' not found — clips will not be written to sheet."
             )
-            job_statuses[job.row_index]["status"] = "analyzing"
-            render_status_table()
 
-            # Mark as in-progress in sheet
+        # Pre-load video cache from sheet (shared read-only baseline for all workers).
+        video_cache = get_session_cache()
+        cache_ws_available = False
+        try:
+            cache_ws = get_worksheet(spreadsheet, cache_tab.strip())
+            sheet_cache = load_sheet_cache(cache_ws)
+            video_cache.update(sheet_cache)
+            cache_ws_available = True
+            st.info(f"Loaded {len(sheet_cache)} cached entries from VideoCache tab.")
+        except ValueError:
+            pass
+
+        jobs = read_queued_jobs(jobs_ws)
+
+    except Exception as e:
+        logger.exception("Failed to connect to Google Sheet", extra={"sheet_url": sheet_url})
+        st.error("Failed to connect to Google Sheet:")
+        st.exception(e)
+        traceback.print_exc()
+        return
+
+    if not jobs:
+        st.info("No queued jobs found in the sheet.")
+        return
+
+    actual_workers = min(int(num_workers), len(jobs))
+    st.info(
+        f"Found {len(jobs)} queued job(s). "
+        f"Starting {actual_workers} parallel worker(s)…"
+    )
+
+    # ── Bootstrap shared state ────────────────────────────────────────────────
+    event_queue: queue.Queue[tuple[str, str, Any]] = queue.Queue()
+    cache_lock = threading.Lock()
+
+    job_states: dict[str, dict[str, Any]] = {
+        f"row_{job.row_index}": {
+            "job_key": f"row_{job.row_index}",
+            "url": job.source_video_url,
+            "status": "queued",
+            "step": "",
+            "error": "",
+            "row_index": job.row_index,
+        }
+        for job in jobs
+    }
+    job_map: dict[str, SheetJob] = {f"row_{job.row_index}": job for job in jobs}
+
+    # Capture config for worker closures.
+    _sheet_id = sheet_id
+    _jobs_tab = jobs_tab.strip()
+    _clips_tab = clips_tab.strip()
+    _cache_tab = cache_tab.strip() if cache_ws_available else ""
+    _shared_cache = video_cache
+    _cache_lock = cache_lock
+
+    def _run_worker(job: SheetJob) -> None:
+        """Process one Clone Batch job with its own isolated gspread connections."""
+        job_key = f"row_{job.row_index}"
+        event_queue.put((job_key, EVT_JOB_START, None))
+
+        try:
+            # Each worker gets its own gspread client — auth tokens and HTTP
+            # sessions are never shared across threads.
+            worker_client = get_gspread_client()
+            worker_spread = worker_client.open_by_key(_sheet_id)
+            worker_jobs_ws = get_worksheet(worker_spread, _jobs_tab)
+
+            worker_clips_ws = None
             try:
-                update_job_status(jobs_ws, job.row_index, "analyzing")
+                worker_clips_ws = get_worksheet(worker_spread, _clips_tab)
+            except ValueError:
+                pass
+
+            worker_cache_ws = None
+            try:
+                if _cache_tab:
+                    worker_cache_ws = get_worksheet(worker_spread, _cache_tab)
+            except ValueError:
+                pass
+
+            # Thread-local copy of the shared cache for safe concurrent reads.
+            with _cache_lock:
+                local_cache = dict(_shared_cache)
+
+            def progress_cb(step: str, msg: str) -> None:
+                event_queue.put((job_key, EVT_JOB_PROGRESS, {"step": step, "msg": msg}))
+
+            try:
+                update_job_status(worker_jobs_ws, job.row_index, "analyzing")
             except Exception:
                 pass
 
-            def make_progress_cb(row_idx: int):
-                def cb(step_name: str, message: str) -> None:
-                    job_statuses[row_idx]["status"] = step_name.lower().replace(" ", "_")
-                    render_status_table()
-                return cb
-
-            result = run_pipeline(
+            result: PipelineResult = run_pipeline(
                 source_video_url=job.source_video_url,
                 reference_image_url=job.reference_image_url,
-                video_cache=video_cache,
-                progress_cb=make_progress_cb(job.row_index),
+                video_cache=local_cache,
+                progress_cb=progress_cb,
             )
 
-            if result.success:
-                job_statuses[job.row_index]["status"] = "complete"
-                logger.info(
-                    "Batch job row completed",
-                    extra={"row_index": job.row_index, "success": True},
-                )
-            else:
-                job_statuses[job.row_index]["status"] = "error"
-                error_msg = result.error or "Unknown error"
-                job_statuses[job.row_index]["error"] = error_msg
+            try:
+                write_job_result(worker_jobs_ws, worker_clips_ws, job.row_index, result)
+            except Exception as exc:
                 logger.warning(
-                    "Batch job row failed",
-                    extra={"row_index": job.row_index, "success": False, "error": error_msg},
+                    "Failed to write job result",
+                    extra={"row_index": job.row_index, "error": str(exc)},
                 )
 
-            # Track for post-batch review.
-            completed_jobs.append(
-                {
-                    "row_index": job.row_index,
-                    "source_video_url": job.source_video_url,
-                    "reference_image_url": job.reference_image_url,
-                    "swapped_image_url": result.swapped_image_url,
-                    "success": result.success,
-                    "error": result.error,
-                }
-            )
-
-            # Write result back to sheet
-            try:
-                write_job_result(jobs_ws, clips_ws, job.row_index, result)
-            except Exception as e:
-                st.warning(f"Failed to write results for row {job.row_index}: {e}")
-
-            # Persist updated video-level cache entry for this job back to the
-            # VideoCache sheet so future batch runs can resume from completed steps.
-            try:
-                if cache_ws is not None and result.context is not None:
+            # Merge this worker's cache updates back into the shared cache and
+            # persist to the VideoCache sheet so future runs can skip these steps.
+            if result.context is not None:
+                try:
                     video_key = result.context.video_key
-                    entry = video_cache.get(video_key, {})
+                    entry = local_cache.get(video_key, {})
                     if isinstance(entry, dict):
-                        # Enrich the cache entry with metadata needed for the VideoCache sheet.
                         entry.setdefault("source_video_url", job.source_video_url)
-
                         if result.analysis and result.analysis.face_visibility.best_window:
                             window = result.analysis.face_visibility.best_window
                             entry.setdefault("face_time_start", window.time_start_s)
                             entry.setdefault("face_time_end", window.time_end_s)
-
-                        # Mark this cache row as completed so it's easy to filter.
                         entry.setdefault("status", "done")
-
-                        # Flatten the latest script onto the top-level cache entry so
-                        # that it can be serialized into the VideoCache tab
-                        # (`final_script_json` column) by `save_to_sheet_cache`.
                         if result.script is not None:
                             entry["script"] = result.script
+                        with _cache_lock:
+                            _shared_cache[video_key] = entry
+                        if worker_cache_ws is not None:
+                            save_to_sheet_cache(worker_cache_ws, video_key, entry)
+                except Exception:
+                    pass
 
-                        if entry:
-                            save_to_sheet_cache(cache_ws, video_key, entry)
-            except Exception:
-                # Cache persistence is best-effort; ignore failures here.
-                pass
+            batch_result = BatchWorkerResult(
+                job_key=job_key,
+                success=result.success,
+                result=result,
+                error=result.error if not result.success else None,
+            )
 
-            render_status_table()
+        except Exception as exc:
+            logger.exception(
+                "Unhandled error in clone batch worker",
+                extra={"row_index": job.row_index},
+            )
+            batch_result = BatchWorkerResult(
+                job_key=job_key,
+                success=False,
+                error=f"Unhandled exception: {exc}",
+            )
 
-        complete_count = sum(1 for v in job_statuses.values() if v["status"] == "complete")
-        error_count = sum(1 for v in job_statuses.values() if v["status"] == "error")
+        event_queue.put((job_key, EVT_JOB_RESULT, batch_result))
 
-        if error_count == 0:
-            st.success(f"All {complete_count} jobs completed successfully!")
-        else:
-            st.warning(f"{complete_count} completed, {error_count} failed.")
+    # ── Persist sheet context for the review / regen UI ───────────────────────
+    st.session_state["batch_last_sheet_context"] = {
+        "sheet_id": sheet_id,
+        "jobs_tab": jobs_tab.strip(),
+        "clips_tab": clips_tab.strip(),
+        "cache_tab": cache_tab.strip(),
+    }
 
-        # Persist summary so the user can review and optionally regenerate images
-        # without re-running the entire batch.
-        st.session_state["batch_last_completed_jobs"] = completed_jobs
+    # ── Launch parallel runner ─────────────────────────────────────────────────
+    runner = ParallelBatchRunner(
+        jobs=jobs,
+        worker_fn=_run_worker,
+        num_workers=actual_workers,
+        event_queue=event_queue,
+    )
 
-    # Handle any pending image-only regeneration request before rendering the
-    # review UI so that progress / results are reflected immediately.
-    regen_target_row = st.session_state.pop("batch_regen_target_row", None)
-    if regen_target_row is not None:
-        sheet_ctx = st.session_state.get("batch_last_sheet_context")  # type: ignore[assignment]
-        completed_jobs: list[dict[str, Any]] | None = st.session_state.get("batch_last_completed_jobs")  # type: ignore[assignment]
-        if isinstance(sheet_ctx, dict) and isinstance(completed_jobs, list):
-            job = next((j for j in completed_jobs if j.get("row_index") == regen_target_row), None)
-            if job is not None:
-                st.session_state["batch_regen_in_progress"] = True
-                try:
-                    _regenerate_single_batch_job_image(job, sheet_ctx)
-                finally:
-                    st.session_state["batch_regen_in_progress"] = False
+    st.session_state[_KEY_QUEUE] = event_queue
+    st.session_state[_KEY_JOB_STATES] = job_states
+    st.session_state[_KEY_JOB_MAP] = job_map
+    st.session_state[_KEY_LOG] = []
+    st.session_state[_KEY_RESULTS] = []
+    st.session_state[_KEY_RUNNING] = True
 
-    # Regardless of whether we just ran a batch, if we have a previous batch
-    # summary in session_state, show the review / regeneration UI so that
-    # interacting with the dropdown doesn't make it disappear.
+    runner.start()
+    st.rerun()
+
+
+# ── Active-run renderer ───────────────────────────────────────────────────────
+
+
+def _render_active_run() -> None:
+    """Drain the event queue, update state, re-render, and auto-refresh."""
+    event_queue: queue.Queue = st.session_state[_KEY_QUEUE]
+    job_states: dict[str, dict] = st.session_state[_KEY_JOB_STATES]
+    log: list[str] = st.session_state[_KEY_LOG]
+    results: list[BatchWorkerResult] = st.session_state.get(_KEY_RESULTS, [])
+
+    all_done = False
+    while True:
+        try:
+            job_key, event_type, data = event_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        if event_type == EVT_ALL_DONE:
+            all_done = True
+            break
+
+        ts = time.strftime("%H:%M:%S")
+        state = job_states.get(job_key, {})
+
+        if event_type == EVT_JOB_START:
+            state["status"] = "analyzing"
+            log.append(f"[{ts}] {job_key} — started")
+
+        elif event_type == EVT_JOB_PROGRESS:
+            if isinstance(data, dict):
+                step = data.get("step", "")
+                state["step"] = step
+                state["status"] = step.lower().replace(" ", "_")
+                log.append(f"[{ts}] {job_key} — {step}")
+
+        elif event_type == EVT_JOB_RESULT:
+            batch_result: BatchWorkerResult = data
+            if batch_result.success:
+                state["status"] = "complete"
+            else:
+                state["status"] = "error"
+                state["error"] = batch_result.error or "Unknown error"
+            results.append(batch_result)
+            indicator = "✓" if batch_result.success else "✗"
+            log.append(
+                f"[{ts}] {job_key} — {indicator} "
+                f"{'done' if batch_result.success else batch_result.error or ''}"
+            )
+
+    st.session_state[_KEY_RESULTS] = results
+
+    # Status table
+    st.subheader("Batch Processing Status")
+    table_rows = [
+        {
+            "Job": s["job_key"],
+            "Video": (s["url"][-60:] if len(s["url"]) > 60 else s["url"]),
+            "Status": s["status"],
+            "Step": s.get("step", ""),
+            "Error": (s["error"][:80] if s.get("error") else ""),
+        }
+        for s in job_states.values()
+    ]
+    st.dataframe(table_rows, width="stretch")
+
+    if log:
+        with st.expander("Event log", expanded=False):
+            st.text("\n".join(log[-50:]))
+
+    if all_done:
+        st.session_state[_KEY_RUNNING] = False
+        _finalize_run(results)
+    else:
+        active = sum(
+            1
+            for s in job_states.values()
+            if s["status"] not in ("complete", "error", "queued")
+        )
+        st.info(
+            f"Processing — {active} job(s) active in parallel. "
+            "Page refreshes every 5 seconds."
+        )
+        time.sleep(5)
+        st.rerun()
+
+
+def _finalize_run(results: list[BatchWorkerResult]) -> None:
+    """Build the completed-jobs summary and render the review section."""
+    job_map: dict[str, SheetJob] = st.session_state.get(_KEY_JOB_MAP, {})
+
+    completed_jobs: list[dict[str, Any]] = []
+    for br in results:
+        job = job_map.get(br.job_key)
+        pipeline_result: PipelineResult | None = br.result
+        completed_jobs.append(
+            {
+                "row_index": job.row_index if job else 0,
+                "source_video_url": job.source_video_url if job else "",
+                "reference_image_url": job.reference_image_url if job else "",
+                "swapped_image_url": (
+                    pipeline_result.swapped_image_url if pipeline_result else None
+                ),
+                "success": br.success,
+                "error": br.error,
+            }
+        )
+    st.session_state["batch_last_completed_jobs"] = completed_jobs
+
+    done_count = sum(1 for br in results if br.success)
+    fail_count = len(results) - done_count
+
+    if fail_count == 0:
+        st.success(f"All {done_count} job(s) completed successfully!")
+    else:
+        st.warning(f"{done_count} completed, {fail_count} failed.")
+
+    if any(not br.success for br in results):
+        st.subheader("Failed jobs")
+        for br in results:
+            if not br.success:
+                st.error(f"**{br.job_key}**: {br.error}")
+
     _render_batch_review_section()
 
 
+# ── Post-run review ───────────────────────────────────────────────────────────
+
+
 def _render_batch_review_section() -> None:
-    completed_jobs: list[dict[str, Any]] | None = st.session_state.get("batch_last_completed_jobs")  # type: ignore[assignment]
-    sheet_ctx: dict[str, str] | None = st.session_state.get("batch_last_sheet_context")  # type: ignore[assignment]
+    completed_jobs: list[dict[str, Any]] | None = st.session_state.get(
+        "batch_last_completed_jobs"
+    )
+    sheet_ctx: dict[str, str] | None = st.session_state.get("batch_last_sheet_context")
 
     if not completed_jobs or not sheet_ctx:
         return
@@ -334,12 +512,15 @@ def _render_batch_review_section() -> None:
         key="batch_review_selected_job",
     )
 
-    # Map selection back to job dict
     selected_idx = options.index(selected_label)
     job = completed_jobs[selected_idx]
 
     if job.get("swapped_image_url"):
-        st.image(job["swapped_image_url"], caption=f"Row {job['row_index']} swapped image", width="stretch")
+        st.image(
+            job["swapped_image_url"],
+            caption=f"Row {job['row_index']} swapped image",
+            width="stretch",
+        )
     else:
         st.info("This job did not produce a swapped image.")
 
@@ -347,7 +528,9 @@ def _render_batch_review_section() -> None:
     with regen_col1:
         st.caption("If you like this result, no action is needed.")
     with regen_col2:
-        regen_in_progress: bool = bool(st.session_state.get("batch_regen_in_progress", False))  # type: ignore[assignment]
+        regen_in_progress: bool = bool(
+            st.session_state.get("batch_regen_in_progress", False)
+        )
         clicked = st.button(
             "Regenerate image only for this row",
             key="batch_regen_image_only",
@@ -356,14 +539,14 @@ def _render_batch_review_section() -> None:
         if regen_in_progress:
             st.caption("Image regeneration in progress...")
         if clicked:
-            # Defer the actual regeneration work to the top-level render() cycle
-            # so we can control button disabling and messaging via session_state.
             st.session_state["batch_regen_target_row"] = job["row_index"]
             st.info("Regenerating image with the same settings...")
             st.rerun()
 
 
-def _regenerate_single_batch_job_image(job: dict[str, Any], sheet_ctx: dict[str, str]) -> None:
+def _regenerate_single_batch_job_image(
+    job: dict[str, Any], sheet_ctx: dict[str, str]
+) -> None:
     """Regenerate only the swapped image for a completed batch job row."""
     try:
         client = get_gspread_client()
@@ -375,7 +558,6 @@ def _regenerate_single_batch_job_image(job: dict[str, Any], sheet_ctx: dict[str,
         except ValueError:
             clips_ws = None
 
-        # Rebuild / refresh the video cache from the sheet (best-effort).
         video_cache = get_session_cache()
         cache_ws = None
         try:
@@ -387,7 +569,6 @@ def _regenerate_single_batch_job_image(job: dict[str, Any], sheet_ctx: dict[str,
 
         row_index = job["row_index"]
 
-        # Run the pipeline in "image-only" mode so we keep analysis/script/etc.
         result = run_pipeline(
             source_video_url=job["source_video_url"],
             reference_image_url=job["reference_image_url"],
@@ -400,13 +581,13 @@ def _regenerate_single_batch_job_image(job: dict[str, Any], sheet_ctx: dict[str,
             st.error(f"Failed to regenerate image for row {row_index}: {result.error}")
             return
 
-        # Only update the swapped image URL — leave all other columns (gender,
-        # script, clips, etc.) untouched so we don't accidentally blank them out.
-        update_job_status(jobs_ws, row_index, "generating", extra_fields={
-            "swapped_start_frame_url": result.swapped_image_url or "",
-        })
+        update_job_status(
+            jobs_ws,
+            row_index,
+            "generating",
+            extra_fields={"swapped_start_frame_url": result.swapped_image_url or ""},
+        )
 
-        # Persist updated cache entry back to the sheet if possible.
         try:
             if cache_ws is not None and result.context is not None:
                 video_key = result.context.video_key
@@ -416,7 +597,6 @@ def _regenerate_single_batch_job_image(job: dict[str, Any], sheet_ctx: dict[str,
         except Exception:
             pass
 
-        # Update in-memory record so the new image is visible in the review UI.
         job["swapped_image_url"] = result.swapped_image_url
         job["success"] = result.success
         job["error"] = result.error

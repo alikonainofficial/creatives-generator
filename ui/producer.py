@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import queue
-import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import streamlit as st
 
 from logging_config import get_logger, setup_logging
+from pipeline.parallel_runner import MAX_BATCH_WORKERS, EVT_ALL_DONE, ParallelBatchRunner
 from pipeline.producer_runner import (
     EVT_BLUEPRINT,
     EVT_BLUEPRINT_READY,
@@ -46,14 +45,13 @@ logger = get_logger(__name__, ui_mode="producer")
 
 # ── Session-state keys ────────────────────────────────────────────────────────
 _KEY_RUNNING = "producer_running"
-_KEY_THREAD = "producer_thread"
 _KEY_QUEUE = "producer_event_queue"
 _KEY_JOB_STATES = "producer_job_states"
 _KEY_RESULTS = "producer_results"
 _KEY_LOG = "producer_log"
 
 _DEFAULT_WORKERS = 5
-_MAX_WORKERS = 10
+_MAX_WORKERS = MAX_BATCH_WORKERS
 
 
 def render() -> None:
@@ -359,21 +357,13 @@ For every job with `status = generating` in your sheet it:
         event_queue.put((job.job_key, "_result", result))
         return result
 
-    def _producer_thread() -> None:
-        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
-            futures = {executor.submit(_run_worker, job): job for job in jobs}
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                except Exception:
-                    # Exceptions are already caught and enqueued inside _run_worker;
-                    # this guard is a last-resort safety net.
-                    pass
-        event_queue.put(("__all__", "_done", None))
-
-    thread = threading.Thread(target=_producer_thread, daemon=True)
-    st.session_state[_KEY_THREAD] = thread
-    thread.start()
+    runner = ParallelBatchRunner(
+        jobs=jobs,
+        worker_fn=_run_worker,
+        num_workers=actual_workers,
+        event_queue=event_queue,
+    )
+    runner.start()
 
     st.rerun()
 
@@ -396,7 +386,7 @@ def _render_active_run() -> None:
         except queue.Empty:
             break
 
-        if event_type == "_done":
+        if event_type == EVT_ALL_DONE:
             all_done = True
             break
 
