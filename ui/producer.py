@@ -190,9 +190,9 @@ For every job with `status = generating` in your sheet it:
                     "Clips within a single job are still generated sequentially."
                 ),
             )
-            enable_pronunciation_fix = st.checkbox(
-                "Fix pronunciation (ElevenLabs + LipSync)",
-                value=True,
+enable_pronunciation_fix = st.checkbox(
+    "Fix pronunciation (ElevenLabs + LipSync)",
+    value=False,
                 help=(
                     "Replace Kling's native audio with ElevenLabs TTS for accurate "
                     "pronunciation. Demucs preserves background ambient audio (street "
@@ -201,9 +201,9 @@ For every job with `status = generating` in your sheet it:
                     "Adds ~60–90 s per clip. Falls back to original Kling audio on error."
                 ),
             )
-            enable_captions = st.checkbox(
-                "Add captions",
-                value=False,
+enable_captions = st.checkbox(
+    "Add captions",
+    value=True,
                 help=(
                     "Burn word-by-word captions into each generated video clip. "
                     "One word is shown at a time, synchronized to speech (white bold text, "

@@ -99,8 +99,8 @@ def run_producer_job(
     progress_cb: ProgressCallback | None = None,
     poll_interval: int = 30,
     max_poll_attempts: int = 40,
-    enable_captions: bool = False,
-    enable_pronunciation_fix: bool = True,
+    enable_captions: bool = True,
+    enable_pronunciation_fix: bool = False,
     enable_voice_selection: bool = True,
 ) -> ProducerJobResult:
     """Run the complete producer pipeline for one job.
