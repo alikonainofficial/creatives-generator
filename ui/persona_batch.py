@@ -109,6 +109,18 @@ Clips are also written to the **Clips** tab (one row per clip segment).
         )
         personas_tab = st.text_input("Personas Tab Name", value="Personas")
         clips_tab = st.text_input("Clips Tab Name", value="Clips")
+        target_duration_s = st.number_input(
+            "Target video length (seconds, excluding app demo)",
+            min_value=10,
+            max_value=60,
+            value=20,
+            step=5,
+            help=(
+                "The desired spoken duration of the generated script, excluding the app demo cutaway. "
+                "Controls word count limits and segment count passed to Gemini. "
+                "Default (20s) matches the original behaviour."
+            ),
+        )
         num_workers = st.number_input(
             "Parallel workers",
             min_value=1,
@@ -138,6 +150,7 @@ Clips are also written to the **Clips** tab (one row per clip segment).
             "personas_tab": personas_tab.strip(),
             "clips_tab": clips_tab.strip(),
             "num_workers": int(num_workers),
+            "target_duration_s": int(target_duration_s),
         },
     )
 
@@ -203,6 +216,7 @@ Clips are also written to the **Clips** tab (one row per clip segment).
     _sheet_id = sheet_id
     _personas_tab = personas_tab.strip()
     _clips_tab = clips_tab.strip()
+    _target_duration_s = int(target_duration_s)
 
     def _run_worker(job: PersonaSheetJob) -> None:
         """Process one Persona Batch job with its own isolated gspread connections."""
@@ -233,6 +247,7 @@ Clips are also written to the **Clips** tab (one row per clip segment).
             result: PersonaPipelineResult = run_persona_pipeline(
                 job=job.job_input,
                 progress_cb=progress_cb,
+                target_duration_s=_target_duration_s,
             )
 
             try:
