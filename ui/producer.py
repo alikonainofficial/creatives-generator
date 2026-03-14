@@ -130,6 +130,23 @@ For every job with `status = generating` in your sheet it:
             "Google Sheet URL or ID",
             placeholder="https://docs.google.com/spreadsheets/d/...",
         )
+        col_out1, col_out2 = st.columns(2)
+        with col_out1:
+            output_sheet_url = st.text_input(
+                "Output Sheet URL or ID (optional)",
+                placeholder="https://docs.google.com/spreadsheets/d/...",
+                help=(
+                    "Link to the output tracking sheet where completed job data will be appended. "
+                    "Expected columns: Date, Job ID, Input Link, Creative Link, Pipeline Type. "
+                    "Leave blank to skip."
+                ),
+            )
+        with col_out2:
+            output_tab = st.text_input(
+                "Output Tab Name",
+                value="Output",
+                help="Tab name in the output tracking sheet.",
+            )
         col1, col2 = st.columns(2)
         with col1:
             jobs_tab = st.text_input(
@@ -223,6 +240,15 @@ For every job with `status = generating` in your sheet it:
         if demo_tab.strip():
             demos_ws = get_worksheet(spreadsheet, demo_tab.strip())
 
+        # Validate output sheet connectivity early so the user gets a fast error.
+        _output_sheet_id: str = ""
+        if output_sheet_url.strip():
+            _output_sheet_id = output_sheet_url.strip()
+            if "spreadsheets/d/" in _output_sheet_id:
+                _output_sheet_id = _output_sheet_id.split("spreadsheets/d/")[1].split("/")[0]
+            _output_spread = client.open_by_key(_output_sheet_id)
+            get_worksheet(_output_spread, output_tab.strip())  # validates tab exists
+
         jobs = read_generating_jobs(jobs_ws)
     except Exception as exc:
         st.error("Failed to connect to Google Sheet:")
@@ -268,9 +294,14 @@ For every job with `status = generating` in your sheet it:
 
     # Capture loop variables for the worker closure.
     _sheet_id = sheet_id
+    _input_sheet_url = sheet_url.strip()
     _jobs_tab = jobs_tab.strip()
     _clips_tab = clips_tab.strip()
     _demo_tab = demo_tab.strip()
+    _output_sheet_id = _output_sheet_id  # already computed above (empty string if not set)
+    _output_tab = output_tab.strip()
+    # Infer pipeline type from the jobs tab name.
+    _pipeline_type = "persona" if "persona" in _jobs_tab.lower() else "clone"
     _drive_folder_id = drive_folder_id.strip()
     _poll_interval = int(poll_interval)
     _enable_pronunciation_fix = bool(enable_pronunciation_fix)
@@ -288,6 +319,18 @@ For every job with `status = generating` in your sheet it:
         worker_clips_ws = get_worksheet(worker_spread, _clips_tab)
         worker_demos_ws = get_worksheet(worker_spread, _demo_tab) if _demo_tab else None
 
+        worker_output_ws = None
+        if _output_sheet_id:
+            try:
+                worker_output_spread = worker_client.open_by_key(_output_sheet_id)
+                worker_output_ws = get_worksheet(worker_output_spread, _output_tab)
+            except Exception as exc:
+                logger.warning(
+                    "Could not open output sheet in worker — output row will be skipped: %s",
+                    exc,
+                    extra={"job_key": job.job_key},
+                )
+
         event_queue.put((job.job_key, "job_start", None))
         try:
             result = run_producer_job(
@@ -296,6 +339,9 @@ For every job with `status = generating` in your sheet it:
                 clips_worksheet=worker_clips_ws,
                 drive_folder_id=_drive_folder_id,
                 demos_worksheet=worker_demos_ws,
+                output_worksheet=worker_output_ws,
+                input_sheet_url=_input_sheet_url,
+                pipeline_type=_pipeline_type,
                 progress_cb=lambda jk, et, d: event_queue.put((jk, et, d)),
                 poll_interval=_poll_interval,
                 max_poll_attempts=40,

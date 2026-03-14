@@ -25,6 +25,7 @@ from services.fal_queue import FalQueueClient
 from services.gemini import GeminiClient
 from services.google_drive import GoogleDriveService
 from sheets.producer_reader import ClipRow, GeneratingJob, read_clips_for_job
+from sheets.output_writer import append_output_row
 from sheets.producer_writer import (
     claim_job,
     mark_job_done,
@@ -92,6 +93,9 @@ def run_producer_job(
     clips_worksheet: gspread.Worksheet,
     drive_folder_id: str,
     demos_worksheet: gspread.Worksheet | None = None,
+    output_worksheet: gspread.Worksheet | None = None,
+    input_sheet_url: str = "",
+    pipeline_type: str = "clone",
     progress_cb: ProgressCallback | None = None,
     poll_interval: int = 30,
     max_poll_attempts: int = 40,
@@ -578,6 +582,24 @@ def run_producer_job(
         fal_video_url=fal_video_url,
         drive_video_url=drive_video_url,
     )
+
+    if output_worksheet is not None:
+        try:
+            append_output_row(
+                output_worksheet,
+                job_id=job.job_key,
+                input_link=input_sheet_url,
+                creative_link=drive_video_url,
+                pipeline_type=pipeline_type,
+            )
+            logger.info("Output row appended", extra={"job_key": job.job_key})
+        except Exception as exc:
+            logger.warning(
+                "Failed to write to output sheet: %s",
+                exc,
+                extra={"job_key": job.job_key},
+            )
+
     emit(EVT_JOB_DONE, {"fal_video_url": fal_video_url, "drive_video_url": drive_video_url})
 
     logger.info(
